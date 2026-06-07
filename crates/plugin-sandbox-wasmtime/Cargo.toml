@@ -1,0 +1,11 @@
+[package]
+name    = "plugin-sandbox-wasmtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+wyrtloom-core = { workspace = true }
+wasmtime      = { workspace = true }
+wat           = { workspace = true }
+thiserror     = { workspace = true }
