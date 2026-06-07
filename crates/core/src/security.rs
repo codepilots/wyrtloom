@@ -150,7 +150,18 @@ impl SecurityModule {
     }
 
     /// Enable persistent audit logging to a JSONL file.
+    ///
+    /// S4: if the file already contains entries, the hash chain is resumed from
+    /// the last persisted line instead of restarting from an empty `prev_hash`
+    /// (which would have created a chain break at every process restart).
     pub fn with_audit_file(mut self, path: &str) -> Result<Self, SecurityError> {
+        // Seed last_hash from the tail of any existing log so the chain continues
+        // across restarts.  Read before opening for append.
+        if let Ok(existing) = std::fs::read_to_string(path) {
+            if let Some(last_line) = existing.lines().rfind(|l| !l.is_empty()) {
+                *self.last_hash.lock().unwrap() = sha256_hex(last_line.as_bytes());
+            }
+        }
         let f = OpenOptions::new()
             .create(true)
             .append(true)
@@ -229,8 +240,13 @@ impl SecurityModule {
         if self.invalidated.lock().unwrap().contains(stamp) {
             return false;
         }
-        let expected = self.compute_mac(content);
-        stamp.0 == expected
+        // Constant-time verification (S3): comparing the MAC with `==` is not
+        // constant-time. `verify_slice` performs a constant-time comparison,
+        // so verification time does not leak how many bytes matched.
+        let mut mac = HmacSha256::new_from_slice(&self.hmac_key)
+            .expect("HMAC key is 32 bytes — valid for any HMAC-SHA256 key size");
+        mac.update(content);
+        mac.verify_slice(&stamp.0).is_ok()
     }
 
     /// Invalidate a stamp when the message it covers is transformed.
@@ -270,7 +286,20 @@ impl SecurityModule {
     }
 
     fn check_file_path(&self, path: &str, prefixes: &[String]) -> bool {
-        !path.contains("..") && prefixes.iter().any(|p| path.starts_with(p.as_str()))
+        use std::path::{Component, Path};
+        // Reject any `..` component via real path parsing. The old textual
+        // `contains("..")` also wrongly rejected legitimate names like `a..b`;
+        // component parsing is precise.
+        if Path::new(path)
+            .components()
+            .any(|c| matches!(c, Component::ParentDir))
+        {
+            return false;
+        }
+        // Boundary-aware prefix match (S2): a prefix only matches at a path
+        // separator, so `/tmp` matches `/tmp` and `/tmp/x` but NOT `/tmpevil`
+        // (the same boundary bug class fixed for the network allowlist in CR-01).
+        prefixes.iter().any(|p| path_has_prefix(path, p))
     }
 
     fn audit(&self, kind: DecisionKind, detail: String) {
@@ -288,10 +317,13 @@ impl SecurityModule {
         } // last_hash lock released; I/O and log push happen outside.
 
         // Optionally persist to file before touching in-memory log.
+        // S4: a persistence failure (e.g. full disk) is surfaced on stderr rather
+        // than silently dropped, since the audit log is a security record.
         if let Some(file_lock) = &self.audit_file {
             let mut f = file_lock.lock().unwrap();
-            let _ = writeln!(f, "{}", serialized);
-            let _ = f.flush();
+            if let Err(e) = writeln!(f, "{}", serialized).and_then(|()| f.flush()) {
+                eprintln!("[wyrtloom][security] failed to persist audit entry: {}", e);
+            }
         }
 
         self.audit_log.lock().unwrap().push(entry);
@@ -315,6 +347,14 @@ fn sha256_hex(data: &[u8]) -> String {
     let mut hasher = sha2::Sha256::new();
     hasher.update(data);
     hex(&hasher.finalize())
+}
+
+/// True if `path` equals `prefix` or lies beneath it at a path-separator
+/// boundary.  Prevents `/tmp` from matching `/tmpevil` while still matching
+/// `/tmp` and `/tmp/sub/file`.
+fn path_has_prefix(path: &str, prefix: &str) -> bool {
+    let trimmed = prefix.strip_suffix('/').unwrap_or(prefix);
+    path == trimmed || path.starts_with(&format!("{}/", trimmed))
 }
 
 // ---------------------------------------------------------------------------
@@ -418,6 +458,30 @@ mod tests {
         assert!(matches!(err, SecurityError::CapabilityDenied(_)));
     }
 
+    // S2 — prefix boundary: `/tmp` must not authorise `/tmpevil`.
+    #[test]
+    fn sibling_directory_sharing_prefix_is_denied() {
+        let mut m = unsafe_manifest();
+        m.capabilities = vec![Capability::FileWrite("/tmpevil/secret".into())];
+        let err = sec().verify(&m).unwrap_err();
+        assert!(matches!(err, SecurityError::CapabilityDenied(_)));
+    }
+
+    #[test]
+    fn path_under_allowed_prefix_is_granted() {
+        let mut m = unsafe_manifest();
+        m.capabilities = vec![Capability::FileWrite("/tmp/sub/file.txt".into())];
+        assert!(sec().verify(&m).is_ok());
+    }
+
+    // S2 — `..` is the only thing rejected; a name merely containing dots is fine.
+    #[test]
+    fn filename_containing_dots_is_allowed() {
+        let mut m = unsafe_manifest();
+        m.capabilities = vec![Capability::FileRead("/tmp/a..b".into())];
+        assert!(sec().verify(&m).is_ok());
+    }
+
     // 004 — HMAC stamps
     #[test]
     fn stamp_is_valid_for_same_content() {
@@ -473,6 +537,50 @@ mod tests {
         let first_json = serde_json::to_string(&log[0]).unwrap();
         let expected_hash = sha256_hex(first_json.as_bytes());
         assert_eq!(log[1].prev_hash, expected_hash);
+    }
+
+    // S4 — the hash chain resumes across a restart instead of forking.
+    #[test]
+    fn audit_chain_resumes_across_restart() {
+        let path = std::env::temp_dir().join(format!(
+            "wyrtloom-audit-{}-{}.jsonl",
+            std::process::id(),
+            uuid_like()
+        ));
+        let path_str = path.to_str().unwrap();
+
+        // First "process": write at least one entry, then drop.
+        {
+            let s = SecurityModule::with_policy(SecurityPolicy::permissive())
+                .with_audit_file(path_str)
+                .unwrap();
+            s.verify(&safe_manifest()).unwrap();
+        }
+
+        let last_line = std::fs::read_to_string(path_str)
+            .unwrap()
+            .lines()
+            .rfind(|l| !l.is_empty())
+            .unwrap()
+            .to_string();
+
+        // Second "process": reopen the same file and write a new entry.
+        let s2 = SecurityModule::with_policy(SecurityPolicy::permissive())
+            .with_audit_file(path_str)
+            .unwrap();
+        s2.verify(&safe_manifest()).unwrap();
+        let new_entry = s2.audit_log_snapshot().into_iter().next().unwrap();
+
+        // The new entry must chain onto the last persisted line, not restart empty.
+        assert_eq!(new_entry.prev_hash, sha256_hex(last_line.as_bytes()));
+        assert!(!new_entry.prev_hash.is_empty());
+
+        let _ = std::fs::remove_file(path_str);
+    }
+
+    fn uuid_like() -> u128 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
     }
 
     #[test]

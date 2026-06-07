@@ -2,6 +2,68 @@
 
 ---
 
+## Second code-review fixes (2026-06-07)
+
+A follow-up review surfaced findings that survived the earlier hardening passes;
+all are now addressed. Test count grew from 103 to 120; all pass, clippy clean.
+
+### Security
+
+- **S1 — SSRF in the Ollama provider base-URL check.**
+  `crates/plugin-provider-ollama/src/lib.rs`. The old
+  `url.starts_with("http://localhost")` test was bypassable
+  (`http://localhost.attacker.com`, `http://127.0.0.1.attacker.com`,
+  `http://localhost@attacker.com`), and the `https://` arm allowed *any* host
+  including cloud metadata (`https://169.254.169.254`). `validate_base_url` now
+  parses with the `url` crate and matches the host exactly: `http` only to
+  loopback (`localhost`/`127.0.0.1`/`::1`), `https` to DNS hosts but not to
+  private/loopback/link-local IP literals.
+- **S2 — File-capability prefix boundary bug.** `crates/core/src/security.rs`.
+  `path.starts_with("/tmp")` matched `/tmpevil`. `check_file_path` now rejects
+  `..` via path-component parsing and uses a separator-boundary prefix match
+  (`path_has_prefix`), the same fix class as CR-01 for hostnames.
+- **S3 — Non-constant-time MAC comparison.** `crates/core/src/security.rs`.
+  `is_valid` compared the HMAC with `==`; it now uses `Mac::verify_slice` for a
+  constant-time check.
+- **S4 — Audit hash-chain broke on restart; write errors were swallowed.**
+  `with_audit_file` now resumes the chain by seeding `last_hash` from the last
+  persisted line, and audit-file write failures are surfaced on stderr.
+
+### Correctness
+
+- **C1 — Sandbox timeout interfered across concurrent executions.**
+  `crates/plugin-sandbox-wasmtime/src/lib.rs`. The wall-clock timeout increments
+  the engine-global epoch; executions are now serialised with an `exec_lock` so
+  one call's timeout cannot prematurely trap another.
+- **C2 — `parse_llm_output` rejected valid JSON with trailing text.**
+  `src/pipeline.rs` now uses a streaming deserialiser that stops at the end of
+  the first object, so `{"status":"done",…} thanks!` parses.
+- **C3 — "Retry"/free-text escalation responses were no-ops.** `src/pipeline.rs`
+  now runs a bounded retry loop (`MAX_ATTEMPTS`): Retry re-runs the task, and
+  free-text guidance is appended to the prompt before retrying.
+- **C4 — `claim()`'s owner was wiped by the next transition.**
+  `crates/plugin-kanban-sqlite/src/lib.rs`. `transition` only clears the actor
+  when returning a task to an unclaimed pool state (Backlog/Todo/Ready); the
+  owner now survives Ready→Running.
+- **C5 — Success path ignored a failed `Done` transition.** `src/pipeline.rs`
+  now returns Blocked (and records it) instead of reporting Done when the board
+  write fails.
+
+### Maintainability
+
+- **M1 — WASM memory limit was never enforced.** `max_memory_bytes` is now
+  applied via a per-store `StoreLimits` ResourceLimiter.
+- **M2** — documented that the plugin factory seam is unused in v0.1.
+- **M3** — removed the duplicated safe-plugin capability check from bootstrap
+  (`SecurityModule::verify` is the single source of truth).
+- **M4** — cleared all clippy warnings (useless `format!`, identical if-blocks,
+  redundant closure, and pre-existing test-only lints).
+- **M5** — renamed the misleading `dotdot_as_filename_component_is_rejected`
+  storage test to `dotdot_within_filename_is_allowed`.
+- **M6** — documented the deliberately-coarse fuel/wall-clock relationship.
+
+---
+
 ## Code-review fixes (2026-06-07)
 
 Ten findings from an internal code review addressed.

@@ -97,7 +97,7 @@ mod tests {
     #[test]
     fn all_message_variants_carry_origin_task_and_hops() {
         let id = task();
-        let messages = vec![
+        let messages = [
             AgentMessage::Request    { origin_task: id, hops: 0, body: vec![] },
             AgentMessage::Response   { origin_task: id, hops: 1, body: vec![] },
             AgentMessage::Delegation { origin_task: id, hops: 2, body: vec![] },

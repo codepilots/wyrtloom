@@ -3,7 +3,7 @@
 /// Order is fixed; a failure at any stage halts with a logged reason.
 /// Security initialises first and verifies each subsequent stage.
 use crate::bus::{BootstrapBus, Event, MessageBus};
-use crate::plugin::{CoreContractVersions, LoadError, PluginClass, PluginManifest, PluginRegistry};
+use crate::plugin::{CoreContractVersions, LoadError, PluginManifest, PluginRegistry};
 use crate::security::SecurityModule;
 use std::sync::Arc;
 
@@ -68,13 +68,9 @@ impl Bootstrapper {
                     ));
                 }
             }
-            // Safe plugin with capabilities is a violation
-            if manifest.class == PluginClass::Safe && !manifest.capabilities.is_empty() {
-                return Err(BootstrapError::PluginLoad(
-                    LoadError::SafePluginRequestedCapability,
-                ));
-            }
-            // Security verification
+            // Security verification — this also rejects SAFE plugins that declare
+            // capabilities (M3: the check is owned solely by SecurityModule::verify
+            // rather than duplicated here).
             security
                 .verify(manifest)
                 .map_err(|e| BootstrapError::PluginLoad(LoadError::SecurityRejected(e.to_string())))?;
@@ -172,7 +168,7 @@ mod tests {
     fn bootstrap_publishes_complete_event() {
         let b = Bootstrapper::new();
         let sys = b.run().unwrap();
-        let mut rx = sys.bus.subscribe("wyrtloom.boot".into());
+        let _rx = sys.bus.subscribe("wyrtloom.boot".into());
         // The event was already sent before we subscribed — in a broadcast channel
         // we won't receive it after the fact, but we can verify the bus is live.
         let _ = sys.bus.publish(Event::new("probe", serde_json::json!({})));

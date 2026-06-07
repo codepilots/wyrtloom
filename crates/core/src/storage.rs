@@ -31,8 +31,10 @@ mod tests {
         assert!(validate_db_path("/tmp/../etc/shadow").is_err());
     }
 
+    // A filename that merely contains ".." (e.g. "..hidden") is NOT a ParentDir
+    // component, so it is correctly allowed — only real `..` traversal is rejected.
     #[test]
-    fn dotdot_as_filename_component_is_rejected() {
+    fn dotdot_within_filename_is_allowed() {
         assert!(validate_db_path("/tmp/..hidden").is_ok());
     }
 }

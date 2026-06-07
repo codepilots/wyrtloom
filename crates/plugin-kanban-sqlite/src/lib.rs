@@ -192,10 +192,25 @@ fn transition_inner(
         }
     }
 
-    conn.execute(
-        "UPDATE tasks SET state = ?1, actor = NULL WHERE id = ?2",
-        params![format!("{:?}", to), id.to_string()],
-    )
+    // C4: only clear the actor when the task returns to an *unclaimed* pool state
+    // (Backlog/Todo/Ready).  Previously every transition nulled the actor, so the
+    // owner established by claim() was wiped by the very next Ready→Running move,
+    // leaving Running tasks with no recorded owner.
+    let clears_actor = matches!(
+        to,
+        TaskState::Backlog | TaskState::Todo | TaskState::Ready
+    );
+    if clears_actor {
+        conn.execute(
+            "UPDATE tasks SET state = ?1, actor = NULL WHERE id = ?2",
+            params![format!("{:?}", to), id.to_string()],
+        )
+    } else {
+        conn.execute(
+            "UPDATE tasks SET state = ?1 WHERE id = ?2",
+            params![format!("{:?}", to), id.to_string()],
+        )
+    }
     .map_err(|e| KanbanError::Storage(format!("update failed (code {})", sqlite_code(&e))))?;
 
     conn.execute(
@@ -273,7 +288,7 @@ fn get_inner(conn: &Connection, id: TaskId) -> Result<Task, KanbanError> {
 
     let block_reason: Option<BlockReason> = block_json
         .as_deref()
-        .map(|s| serde_json::from_str(s))
+        .map(serde_json::from_str)
         .transpose()
         .map_err(|_| KanbanError::Storage("integrity error: malformed block_reason".into()))?;
 
@@ -409,6 +424,33 @@ mod tests {
         let task = b.get(id).unwrap();
         assert_eq!(task.state, TaskState::Blocked);
         assert!(task.block_reason.is_some());
+    }
+
+    // C4 — the claiming worker remains the owner after Ready→Running.
+    #[test]
+    fn claim_owner_survives_running_transition() {
+        let b = board();
+        let id = b.create(new_task("t")).unwrap();
+        b.transition(id, TaskState::Todo, "a".into(), None).unwrap();
+        b.transition(id, TaskState::Ready, "a".into(), None).unwrap();
+        b.claim(id, "agent:w".into()).unwrap();
+        b.transition(id, TaskState::Running, "agent:w".into(), None).unwrap();
+        let task = b.get(id).unwrap();
+        assert_eq!(task.state, TaskState::Running);
+        assert_eq!(task.actor.as_deref(), Some("agent:w"));
+    }
+
+    // C4 — returning a task to the pool clears the owner so it can be re-claimed.
+    #[test]
+    fn returning_to_todo_clears_actor() {
+        let b = board();
+        let id = b.create(new_task("t")).unwrap();
+        b.transition(id, TaskState::Todo, "a".into(), None).unwrap();
+        b.transition(id, TaskState::Ready, "a".into(), None).unwrap();
+        b.claim(id, "agent:w".into()).unwrap();
+        b.transition(id, TaskState::Running, "agent:w".into(), None).unwrap();
+        b.transition(id, TaskState::Todo, "agent:w".into(), None).unwrap();
+        assert_eq!(b.get(id).unwrap().actor, None);
     }
 
     #[test]

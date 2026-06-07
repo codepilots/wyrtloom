@@ -91,6 +91,12 @@ impl PluginRegistry {
         self.entries.lock().unwrap().iter().map(|(m, _)| m.clone()).collect()
     }
 
+    /// Drain the registered (manifest, factory) pairs.
+    ///
+    /// M2: in v0.1 the bootstrap only *validates* manifests; concrete plugins are
+    /// instantiated directly by the binary (`main.rs`), so this accessor is the
+    /// seam reserved for Phase 2 dynamic instantiation and is not yet exercised
+    /// by the boot sequence.
     pub fn take_factories(&self) -> Vec<(PluginManifest, PluginFactory)> {
         std::mem::take(&mut *self.entries.lock().unwrap())
     }
