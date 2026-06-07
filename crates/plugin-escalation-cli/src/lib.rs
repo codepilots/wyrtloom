@@ -1,6 +1,6 @@
 use std::io::{self, BufRead, Write};
 use wyrtloom_core::escalation::{
-    ActionOption, Escalation, EscalationError, HumanEscalation, HumanResponse,
+    Escalation, EscalationError, HumanEscalation, HumanResponse,
 };
 
 pub struct CliEscalation;
@@ -103,6 +103,7 @@ impl HumanEscalation for ScriptedEscalation {
 mod tests {
     use super::*;
     use uuid::Uuid;
+    use wyrtloom_core::escalation::ActionOption;
 
     fn escalation() -> Escalation {
         Escalation {

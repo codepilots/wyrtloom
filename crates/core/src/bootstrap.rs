@@ -48,12 +48,10 @@ impl Bootstrapper {
         // Stages 4-8: interfaces register (they are trait objects; we validate manifests here)
         let manifests = self.registry.manifests();
         for manifest in &manifests {
-            // Check manifest schema
-            if manifest.name.is_empty() {
-                return Err(BootstrapError::PluginLoad(LoadError::ManifestInvalid(
-                    "plugin name is empty".into(),
-                )));
-            }
+            // Check manifest schema — includes name character-set validation (finding 020).
+            PluginManifest::validate_name(&manifest.name).map_err(|e| {
+                BootstrapError::PluginLoad(LoadError::ManifestInvalid(e))
+            })?;
             // Check contract versions
             for (contract_id, required_version) in &manifest.implements {
                 if !contract_versions.is_compatible(contract_id, required_version) {

@@ -1,4 +1,11 @@
+/// SQLite call-logger plugin.
+///
+/// Security hardening (see CHANGELOG.md):
+///   010 – open() validates the path to prevent traversal.
+///   011 – Unknown outcome strings return a Storage error rather than
+///         silently mapping to Completed.
 use rusqlite::{params, Connection};
+use std::path::Path;
 use std::sync::Mutex;
 use wyrtloom_core::logger::{CallLog, CallLogger, CallOutcome, LogError};
 use wyrtloom_core::types::Timestamp;
@@ -12,6 +19,9 @@ impl SqliteCallLogger {
         let conn = if path == ":memory:" {
             Connection::open_in_memory()?
         } else {
+            validate_db_path(path).map_err(|e| {
+                rusqlite::Error::InvalidPath(std::path::PathBuf::from(e))
+            })?;
             Connection::open(path)?
         };
         let logger = Self { conn: Mutex::new(conn) };
@@ -26,18 +36,18 @@ impl SqliteCallLogger {
     fn init_schema(&self) -> Result<(), rusqlite::Error> {
         self.conn.lock().unwrap().execute_batch(
             "CREATE TABLE IF NOT EXISTS call_logs (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                task_id      TEXT NOT NULL,
-                profile      TEXT NOT NULL,
-                provider     TEXT NOT NULL,
-                model        TEXT NOT NULL,
-                input_tokens INTEGER NOT NULL,
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id       TEXT NOT NULL,
+                profile       TEXT NOT NULL,
+                provider      TEXT NOT NULL,
+                model         TEXT NOT NULL,
+                input_tokens  INTEGER NOT NULL,
                 output_tokens INTEGER NOT NULL,
                 cost_microdollars INTEGER,
                 cost_currency TEXT,
-                outcome      TEXT NOT NULL,
+                outcome       TEXT NOT NULL,
                 outcome_detail TEXT,
-                at           TEXT NOT NULL
+                at            TEXT NOT NULL
             );",
         )
     }
@@ -52,7 +62,7 @@ impl SqliteCallLogger {
                         outcome, outcome_detail, at
                  FROM call_logs ORDER BY id",
             )
-            .map_err(|e| LogError::Storage(e.to_string()))?;
+            .map_err(|_| LogError::Storage("prepare failed".into()))?;
 
         let rows = stmt
             .query_map([], |row| {
@@ -70,7 +80,7 @@ impl SqliteCallLogger {
                     row.get::<_, String>(10)?,
                 ))
             })
-            .map_err(|e| LogError::Storage(e.to_string()))?;
+            .map_err(|_| LogError::Storage("query failed".into()))?;
 
         let mut logs = vec![];
         for row in rows {
@@ -78,24 +88,30 @@ impl SqliteCallLogger {
                  input_tokens, output_tokens,
                  cost_microdollars, cost_currency,
                  outcome_str, outcome_detail, at_str) =
-                row.map_err(|e| LogError::Storage(e.to_string()))?;
+                row.map_err(|_| LogError::Storage("row read failed".into()))?;
 
-            let task = task_id_str.parse().map_err(|e: uuid::Error| LogError::Storage(e.to_string()))?;
+            let task = task_id_str
+                .parse()
+                .map_err(|_| LogError::Storage("integrity error: malformed task_id".into()))?;
 
             let cost = cost_microdollars.zip(cost_currency).map(|(amt, cur)| {
                 wyrtloom_core::types::Money { amount_microdollars: amt, currency: cur }
             });
 
+            // 011 — unknown outcome is an integrity violation, not silently Completed.
             let outcome = match outcome_str.as_str() {
                 "Completed" => CallOutcome::Completed,
                 "Failed"    => CallOutcome::Failed(outcome_detail.unwrap_or_default()),
                 "Partial"   => CallOutcome::Partial(outcome_detail.unwrap_or_default()),
-                _           => CallOutcome::Completed,
+                other => return Err(LogError::Storage(
+                    format!("integrity error: unknown outcome '{}'", other)
+                )),
             };
 
+            // 011 — invalid timestamp is an integrity error.
             let at = chrono::DateTime::parse_from_rfc3339(&at_str)
                 .map(|dt| Timestamp(dt.with_timezone(&chrono::Utc)))
-                .unwrap_or_else(|_| Timestamp::now());
+                .map_err(|_| LogError::Storage(format!("integrity error: malformed timestamp")))?;
 
             logs.push(CallLog {
                 task,
@@ -111,12 +127,23 @@ impl SqliteCallLogger {
     }
 }
 
+fn validate_db_path(path: &str) -> Result<(), String> {
+    let p = Path::new(path);
+    for component in p.components() {
+        use std::path::Component;
+        if matches!(component, Component::ParentDir) {
+            return Err(format!("path traversal not allowed: {}", path));
+        }
+    }
+    Ok(())
+}
+
 impl CallLogger for SqliteCallLogger {
     fn record(&self, entry: CallLog) -> Result<(), LogError> {
         let (outcome_str, outcome_detail) = match &entry.outcome {
-            CallOutcome::Completed       => ("Completed", None),
-            CallOutcome::Failed(s)       => ("Failed", Some(s.clone())),
-            CallOutcome::Partial(s)      => ("Partial", Some(s.clone())),
+            CallOutcome::Completed  => ("Completed", None),
+            CallOutcome::Failed(s)  => ("Failed", Some(s.clone())),
+            CallOutcome::Partial(s) => ("Partial", Some(s.clone())),
         };
 
         let (cost_microdollars, cost_currency) = match &entry.usage.cost {
@@ -148,7 +175,7 @@ impl CallLogger for SqliteCallLogger {
                     entry.at.0.to_rfc3339(),
                 ],
             )
-            .map_err(|e| LogError::Storage(e.to_string()))?;
+            .map_err(|_| LogError::Storage("insert failed".into()))?;
         Ok(())
     }
 }
@@ -222,5 +249,12 @@ mod tests {
         assert_eq!(logs[0].task, task_id);
         assert_eq!(logs[0].provider, "ollama");
         assert_eq!(logs[0].model, "llama3.2");
+    }
+
+    // 010 — path traversal is rejected
+    #[test]
+    fn path_with_parent_traversal_is_rejected() {
+        let result = SqliteCallLogger::open("../etc/sensitive.db");
+        assert!(result.is_err());
     }
 }

@@ -51,9 +51,13 @@ pub struct Money {
 }
 
 impl Money {
+    /// Construct from a dollar amount.
+    /// Rounds to the nearest microdollar rather than truncating, preventing
+    /// systematic under-reporting due to floating-point representation
+    /// (finding 017 — security audit).
     pub fn usd(dollars: f64) -> Self {
         Self {
-            amount_microdollars: (dollars * 1_000_000.0) as i64,
+            amount_microdollars: (dollars * 1_000_000.0).round() as i64,
             currency: "USD".to_string(),
         }
     }

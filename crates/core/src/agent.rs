@@ -1,10 +1,19 @@
+/// Agent message contracts.
+///
+/// Security hardening (see CHANGELOG.md):
+///   016 – validate() now enforces MAX_HOPS (16) and MAX_BODY_BYTES (1 MiB)
+///         to prevent message-loop DoS and oversized-payload attacks.
 use crate::types::{Bytes, TaskId};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// Maximum number of hops before a message is considered a loop.
+pub const MAX_HOPS: u8 = 16;
+
+/// Maximum body size in bytes (1 MiB).
+pub const MAX_BODY_BYTES: usize = 1024 * 1024;
+
 /// Typed vocabulary for agent-to-agent communication.
-/// Hop counter and origin task id are present and validated in v0.1;
-/// hop-limit enforcement and cycle detection arrive in Phase 2.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AgentMessage {
     Request    { origin_task: TaskId, hops: u8, body: Bytes },
@@ -44,13 +53,37 @@ impl AgentMessage {
     }
 
     /// Validate the message is well-formed.
+    /// Enforces hop limit and body size to prevent loop-based DoS.
     pub fn validate(&self) -> Result<(), MessageError> {
+        // Hop limit — enforced now, not deferred to Phase 2 (finding 016).
+        if self.hops() >= MAX_HOPS {
+            return Err(MessageError::Malformed(format!(
+                "hop limit exceeded: {} >= {}",
+                self.hops(), MAX_HOPS
+            )));
+        }
+
         match self {
             AgentMessage::Error { error, .. } if error.is_empty() => {
-                Err(MessageError::Malformed("error messages must have a non-empty error".into()))
+                return Err(MessageError::Malformed(
+                    "error messages must have a non-empty error field".into(),
+                ));
             }
-            _ => Ok(()),
+            // Body size check for message variants that carry a body.
+            AgentMessage::Request    { body, .. }
+            | AgentMessage::Response   { body, .. }
+            | AgentMessage::Delegation { body, .. }
+            | AgentMessage::Result     { body, .. }
+                if body.len() > MAX_BODY_BYTES =>
+            {
+                return Err(MessageError::Malformed(format!(
+                    "body too large: {} bytes > {} limit",
+                    body.len(), MAX_BODY_BYTES
+                )));
+            }
+            _ => {}
         }
+        Ok(())
     }
 }
 
@@ -79,16 +112,41 @@ mod tests {
 
     #[test]
     fn valid_messages_pass_validation() {
-        let id = task();
-        let m = AgentMessage::Request { origin_task: id, hops: 0, body: b"hello".to_vec() };
+        let m = AgentMessage::Request { origin_task: task(), hops: 0, body: b"hello".to_vec() };
         assert!(m.validate().is_ok());
     }
 
     #[test]
     fn error_message_with_empty_error_is_malformed() {
-        let id = task();
-        let m = AgentMessage::Error { origin_task: id, hops: 0, error: "".into() };
+        let m = AgentMessage::Error { origin_task: task(), hops: 0, error: "".into() };
         assert!(matches!(m.validate(), Err(MessageError::Malformed(_))));
+    }
+
+    // 016 — hop limit
+    #[test]
+    fn message_at_hop_limit_is_malformed() {
+        let m = AgentMessage::Request { origin_task: task(), hops: MAX_HOPS, body: vec![] };
+        assert!(matches!(m.validate(), Err(MessageError::Malformed(_))));
+    }
+
+    #[test]
+    fn message_just_below_hop_limit_is_valid() {
+        let m = AgentMessage::Request { origin_task: task(), hops: MAX_HOPS - 1, body: vec![] };
+        assert!(m.validate().is_ok());
+    }
+
+    #[test]
+    fn oversized_body_is_malformed() {
+        let big = vec![0u8; MAX_BODY_BYTES + 1];
+        let m = AgentMessage::Request { origin_task: task(), hops: 0, body: big };
+        assert!(matches!(m.validate(), Err(MessageError::Malformed(_))));
+    }
+
+    #[test]
+    fn body_at_size_limit_is_valid() {
+        let exact = vec![0u8; MAX_BODY_BYTES];
+        let m = AgentMessage::Request { origin_task: task(), hops: 0, body: exact };
+        assert!(m.validate().is_ok());
     }
 
     #[test]

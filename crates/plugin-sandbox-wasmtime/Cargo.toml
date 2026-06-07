@@ -9,3 +9,4 @@ wyrtloom-core = { workspace = true }
 wasmtime      = { workspace = true }
 wat           = { workspace = true }
 thiserror     = { workspace = true }
+sha2          = { workspace = true }

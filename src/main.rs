@@ -22,7 +22,6 @@ fn main() -> anyhow::Result<()> {
     // ── Stage 1-8: Bootstrap sequence ────────────────────────────────────────
     let mut bootstrapper = Bootstrapper::new();
 
-    // Register the plugins with their manifests so the security module verifies them.
     bootstrapper.register_plugin(
         PluginManifest {
             name: "plugin-kanban-sqlite".into(),
@@ -92,29 +91,26 @@ fn main() -> anyhow::Result<()> {
 
     // ── Instantiate plugin implementations ────────────────────────────────────
     let kanban   = Arc::new(SqliteKanbanBoard::in_memory()?);
+    // OllamaProvider::new() is now fallible — URL validated at construction.
     let provider = Arc::new(OllamaProvider::default_local());
     let logger   = Arc::new(SqliteCallLogger::in_memory()?);
+    // WasmtimeSandbox::new() is explicitly fallible; no Default impl (finding 019).
     let sandbox  = WasmtimeSandbox::new()?;
 
     println!("[boot] All plugins instantiated ✓");
 
     // ── Demo: sandbox isolation test ──────────────────────────────────────────
     println!("\n--- Sandbox isolation demo ---");
-    let wat = r#"
+    let wat_ok = r#"
 (module
   (memory (export "memory") 1)
   (func (export "run") (param i32 i32) (result i64) i64.const 0)
 )
 "#;
-    let wasm_bytes = wat::parse_str(wat)?;
-    let result = sandbox.execute(
-        SafeModule { wasm_bytes },
-        vec![],
-        ResourceLimits::default(),
-    );
-    println!("[sandbox] SAFE module executed, result: {:?}", result.is_ok());
+    let wasm_bytes = wat::parse_str(wat_ok)?;
+    let result = sandbox.execute(SafeModule { wasm_bytes }, vec![], ResourceLimits::default());
+    println!("[sandbox] SAFE module executed, result ok = {}", result.is_ok());
 
-    // Module that tries to import a host function — must fail.
     let bad_wat = r#"
 (module
   (import "env" "read_file" (func (param i32) (result i32)))
@@ -124,24 +120,20 @@ fn main() -> anyhow::Result<()> {
 "#;
     let bad_wasm = wat::parse_str(bad_wat)?;
     let isolation_result = sandbox.execute(
-        SafeModule { wasm_bytes: bad_wasm },
-        vec![],
-        ResourceLimits::default(),
+        SafeModule { wasm_bytes: bad_wasm }, vec![], ResourceLimits::default(),
     );
     println!(
-        "[sandbox] Module with host import: isolated correctly = {}",
+        "[sandbox] Module with host import isolated = {}",
         isolation_result.is_err()
     );
 
     // ── Demo: task pipeline ────────────────────────────────────────────────────
     println!("\n--- Task pipeline demo ---");
 
-    // Use scripted escalation so the demo doesn't block on stdin.
     let escalation: Arc<dyn wyrtloom_core::escalation::HumanEscalation> =
         if std::env::var("WYRTLOOM_INTERACTIVE").is_ok() {
             Arc::new(CliEscalation::new())
         } else {
-            // In non-interactive mode, auto-stop on any escalation.
             Arc::new(ScriptedEscalation::stop())
         };
 
@@ -154,7 +146,7 @@ fn main() -> anyhow::Result<()> {
         agent_id:  "agent:wyrtloom-v01".into(),
     };
 
-    let prompt = "What is 2 + 2? Reply with DONE:<answer>.";
+    let prompt = r#"What is 2 + 2? Answer with {"status":"done","result":"4"}"#;
     println!("[pipeline] Running task: {}", prompt);
 
     match pipeline.run("arithmetic-demo", prompt) {
@@ -169,12 +161,7 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Show call log
-    println!("\n--- Call log ---");
-    // (logger is in-memory; showing count as demonstration)
-    println!("[logger] SQLite call logger is live and recording every LLM call.");
-    println!("[logger] Token counts and provider info are captured per the contract.");
-
+    println!("\n[logger] SQLite call logger recording every LLM call with tokens + cost.");
     println!("\n🌿 Wyrtloom v0.1 boot complete.");
     Ok(())
 }

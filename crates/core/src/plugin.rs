@@ -1,7 +1,11 @@
+/// Plugin manifest, capability model, and loader contract.
+///
+/// Security hardening (see CHANGELOG.md):
+///   020 – Plugin names are validated against [a-z0-9_-]{1,64}.
 use crate::types::{ContractId, SemVer};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,6 +33,26 @@ pub struct PluginManifest {
     pub implements: Vec<(ContractId, SemVer)>,
 }
 
+impl PluginManifest {
+    /// Validate that the manifest's name conforms to [a-z0-9_-]{1,64}.
+    /// Returns an error message if invalid.
+    pub fn validate_name(name: &str) -> Result<(), String> {
+        if name.is_empty() {
+            return Err("plugin name must not be empty".into());
+        }
+        if name.len() > 64 {
+            return Err(format!("plugin name exceeds 64 characters: {}", name.len()));
+        }
+        if !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_') {
+            return Err(format!(
+                "plugin name '{}' contains characters outside [a-z0-9_-]",
+                name
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum LoadError {
     #[error("manifest is invalid: {0}")]
@@ -45,7 +69,7 @@ pub enum LoadError {
     SafePluginRequestedCapability,
 }
 
-pub type PluginFactory = Box<dyn Fn() -> Arc<dyn std::any::Any + Send + Sync> + Send + Sync>;
+pub type PluginFactory = Box<dyn Fn() -> std::sync::Arc<dyn std::any::Any + Send + Sync> + Send + Sync>;
 
 pub struct PluginRegistry {
     entries: Mutex<Vec<(PluginManifest, PluginFactory)>>,
@@ -58,7 +82,7 @@ impl PluginRegistry {
 
     pub fn register<F>(&self, manifest: PluginManifest, factory: F)
     where
-        F: Fn() -> Arc<dyn std::any::Any + Send + Sync> + Send + Sync + 'static,
+        F: Fn() -> std::sync::Arc<dyn std::any::Any + Send + Sync> + Send + Sync + 'static,
     {
         self.entries.lock().unwrap().push((manifest, Box::new(factory)));
     }
@@ -121,8 +145,6 @@ mod tests {
 
     #[test]
     fn contract_version_compatibility_same_major_higher_minor() {
-        let core = CoreContractVersions::v0_1();
-        // Providing v0.2 should be compatible with a core that requires v0.1
         let newer = SemVer::new(0, 2, 0);
         assert!(newer.is_compatible_with(&SemVer::new(0, 1, 0)));
     }
@@ -153,8 +175,43 @@ mod tests {
         let registry = PluginRegistry::new();
         registry.register(
             minimal_manifest(PluginClass::Safe, vec![]),
-            || Arc::new(()),
+            || std::sync::Arc::new(()),
         );
         assert_eq!(registry.manifests().len(), 1);
+    }
+
+    // 020 — name validation
+    #[test]
+    fn valid_plugin_names_are_accepted() {
+        for name in &["kanban-sqlite", "provider_ollama", "bus-tokio-v2", "a1b2"] {
+            assert!(PluginManifest::validate_name(name).is_ok(), "should accept: {}", name);
+        }
+    }
+
+    #[test]
+    fn empty_name_is_rejected() {
+        assert!(PluginManifest::validate_name("").is_err());
+    }
+
+    #[test]
+    fn name_with_path_separator_is_rejected() {
+        assert!(PluginManifest::validate_name("../evil").is_err());
+        assert!(PluginManifest::validate_name("/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn name_with_uppercase_is_rejected() {
+        assert!(PluginManifest::validate_name("MyPlugin").is_err());
+    }
+
+    #[test]
+    fn name_with_escape_sequence_is_rejected() {
+        assert!(PluginManifest::validate_name("plugin\x1b[2J").is_err());
+    }
+
+    #[test]
+    fn name_exceeding_64_chars_is_rejected() {
+        let long = "a".repeat(65);
+        assert!(PluginManifest::validate_name(&long).is_err());
     }
 }
