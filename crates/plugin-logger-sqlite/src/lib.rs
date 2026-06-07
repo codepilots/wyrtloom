@@ -5,9 +5,9 @@
 ///   011 – Unknown outcome strings return a Storage error rather than
 ///         silently mapping to Completed.
 use rusqlite::{params, Connection};
-use std::path::Path;
 use std::sync::Mutex;
 use wyrtloom_core::logger::{CallLog, CallLogger, CallOutcome, LogError};
+use wyrtloom_core::storage::validate_db_path;
 use wyrtloom_core::types::Timestamp;
 
 pub struct SqliteCallLogger {
@@ -127,16 +127,6 @@ impl SqliteCallLogger {
     }
 }
 
-fn validate_db_path(path: &str) -> Result<(), String> {
-    let p = Path::new(path);
-    for component in p.components() {
-        use std::path::Component;
-        if matches!(component, Component::ParentDir) {
-            return Err(format!("path traversal not allowed: {}", path));
-        }
-    }
-    Ok(())
-}
 
 impl CallLogger for SqliteCallLogger {
     fn record(&self, entry: CallLog) -> Result<(), LogError> {

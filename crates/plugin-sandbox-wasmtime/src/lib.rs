@@ -7,7 +7,6 @@
 ///   014 – Compiled modules are cached by SHA-256 of their WASM bytes to
 ///         prevent repeated Cranelift compilation (CPU DoS vector).
 ///   019 – Default trait impl removed; construction is now explicitly fallible.
-use sha2::Digest;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -54,32 +53,19 @@ impl SandboxRuntime for WasmtimeSandbox {
             )));
         }
 
-        // 014 — look up or compile the module.
-        let wasm_hash = sha256(&module.wasm_bytes);
+        // 014 — look up or compile the module using the precomputed hash from
+        // SafeModule::new(), avoiding a full SHA-256 on every cache-hit call.
         let compiled = {
             let mut cache = self.module_cache.lock().unwrap();
-            if let Some(m) = cache.get(&wasm_hash) {
+            if let Some(m) = cache.get(&module.content_hash) {
                 m.clone()
             } else {
                 let m = Module::new(&self.engine, &module.wasm_bytes)
                     .map_err(|e| SandboxError::Compile(e.to_string()))?;
-                cache.insert(wasm_hash, m.clone());
+                cache.insert(module.content_hash, m.clone());
                 m
             }
         };
-
-        // 013 — set up a background thread to trigger an epoch interrupt after
-        // max_wallclock_ms, providing a real wall-clock timeout.
-        let engine_ref = Arc::clone(&self.engine);
-        let deadline_ms = limits.max_wallclock_ms;
-        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let cancel_clone = Arc::clone(&cancel);
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(deadline_ms));
-            if !cancel_clone.load(std::sync::atomic::Ordering::SeqCst) {
-                engine_ref.increment_epoch();
-            }
-        });
 
         let mut store = Store::new(&self.engine, ());
 
@@ -124,11 +110,25 @@ impl SandboxRuntime for WasmtimeSandbox {
             .get_typed_func::<(i32, i32), i64>(&mut store, "run")
             .map_err(|e| SandboxError::Trap(format!("module must export 'run': {}", e)))?;
 
+        // 013 — spawn the epoch timer only here, after all fallible setup has
+        // succeeded.  Earlier spawning left a live thread on every early-return
+        // error path; that leaked increment would corrupt the *next* call's
+        // relative epoch deadline.
+        let engine_ref = Arc::clone(&self.engine);
+        let deadline_ms = limits.max_wallclock_ms;
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_clone = Arc::clone(&cancel);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(deadline_ms));
+            if !cancel_clone.load(std::sync::atomic::Ordering::SeqCst) {
+                engine_ref.increment_epoch();
+            }
+        });
+
         let result = run
             .call(&mut store, (0, input_len))
             .map_err(|e| {
                 let msg = e.to_string();
-                // Epoch trap appears as "epoch" in the message.
                 if msg.contains("epoch") || msg.contains("interrupt") {
                     SandboxError::Timeout
                 } else if msg.contains("fuel") || msg.contains("all fuel") {
@@ -159,11 +159,6 @@ impl SandboxRuntime for WasmtimeSandbox {
     }
 }
 
-fn sha256(data: &[u8]) -> [u8; 32] {
-    let mut h = sha2::Sha256::new();
-    h.update(data);
-    h.finalize().into()
-}
 
 #[cfg(test)]
 mod tests {
@@ -185,7 +180,7 @@ mod tests {
         )
         .unwrap();
         let out = sb
-            .execute(SafeModule { wasm_bytes: wasm }, vec![], ResourceLimits::default())
+            .execute(SafeModule::new(wasm), vec![], ResourceLimits::default())
             .unwrap();
         assert!(out.is_empty());
     }
@@ -201,7 +196,7 @@ mod tests {
         )
         .unwrap();
         let err = sb
-            .execute(SafeModule { wasm_bytes: wasm }, vec![], ResourceLimits::default())
+            .execute(SafeModule::new(wasm), vec![], ResourceLimits::default())
             .unwrap_err();
         assert!(matches!(err, SandboxError::Trap(_)));
     }
@@ -211,7 +206,7 @@ mod tests {
         let sb = sandbox();
         let err = sb
             .execute(
-                SafeModule { wasm_bytes: b"not wasm at all".to_vec() },
+                SafeModule::new(b"not wasm at all".to_vec()),
                 vec![],
                 ResourceLimits::default(),
             )
@@ -232,7 +227,7 @@ mod tests {
         )
         .unwrap();
         let err = sb
-            .execute(SafeModule { wasm_bytes: wasm }, vec![], ResourceLimits::default())
+            .execute(SafeModule::new(wasm), vec![], ResourceLimits::default())
             .unwrap_err();
         assert!(matches!(err, SandboxError::Trap(_)));
     }
@@ -254,7 +249,7 @@ mod tests {
         // A 65 KiB input into a 64 KiB (1-page) WASM memory should fail.
         let big = vec![0u8; 65 * 1024]; // > 1 WASM page (64 KiB)
         let err = sb
-            .execute(SafeModule { wasm_bytes: wasm }, big, ResourceLimits::default())
+            .execute(SafeModule::new(wasm), big, ResourceLimits::default())
             .unwrap_err();
         assert!(matches!(err, SandboxError::Trap(_)));
     }
@@ -273,7 +268,7 @@ mod tests {
         // Execute twice — second call hits the cache.
         for _ in 0..2 {
             sb.execute(
-                SafeModule { wasm_bytes: wasm.clone() },
+                SafeModule::new(wasm.clone()),
                 vec![],
                 ResourceLimits::default(),
             )

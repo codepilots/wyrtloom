@@ -9,13 +9,13 @@
 ///   022 – Raw rusqlite error strings are mapped to opaque categories before
 ///         being wrapped in KanbanError::Storage.
 use rusqlite::{params, Connection};
-use std::path::Path;
 use std::sync::Mutex;
 use uuid::Uuid;
 use wyrtloom_core::kanban::{
     BlockReason, is_legal_transition, KanbanBoard, KanbanError, NewTask, StateChange,
     Task, TaskState,
 };
+use wyrtloom_core::storage::validate_db_path;
 use wyrtloom_core::types::{ActorId, TaskId, Timestamp};
 
 pub struct SqliteKanbanBoard {
@@ -82,17 +82,6 @@ impl SqliteKanbanBoard {
     }
 }
 
-/// Validate a database path: reject ".." traversal components.
-fn validate_db_path(path: &str) -> Result<(), String> {
-    let p = Path::new(path);
-    for component in p.components() {
-        use std::path::Component;
-        if matches!(component, Component::ParentDir) {
-            return Err(format!("path traversal not allowed: {}", path));
-        }
-    }
-    Ok(())
-}
 
 
 impl KanbanBoard for SqliteKanbanBoard {

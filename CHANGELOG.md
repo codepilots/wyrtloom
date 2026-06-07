@@ -2,6 +2,114 @@
 
 ---
 
+## Code-review fixes (2026-06-07)
+
+Ten findings from an internal code review addressed.
+Test count grew from 100 to 103; all pass.
+
+---
+
+### Security fixes
+
+#### CR-01 — Network allowlist suffix matching now requires a dot separator
+**File:** `crates/core/src/security.rs`
+**Was:** `host.ends_with(allowed)` — a hostname like `"evillocalhost"` matched the
+allowlist entry `"localhost"` because the suffix check had no separator guard.
+The default permissive policy's `["localhost", "127.0.0.1"]` entries were both
+bypassable this way.
+**Fix:** Changed to `host.ends_with(&format!(".{}", allowed))` (subdomain match)
+combined with the existing exact-match check (`host == allowed`).
+Only `"localhost"` itself or `"sub.localhost"` now match `"localhost"`.
+
+#### CR-04 — `audit()` hash chain is now race-free under concurrent callers
+**File:** `crates/core/src/security.rs`
+**Was:** `last_hash` was acquired once to read `prev_hash`, released, and acquired
+again to write `new_hash` — a window in which a second thread could read the
+same `prev_hash`, silently forking the chain.
+**Fix:** Both the read of `prev_hash` and the write of `new_hash` now happen
+inside a single lock scope.  The file write and log push happen after the lock
+is released to avoid blocking other auditors during I/O.
+
+---
+
+### Correctness fixes
+
+#### CR-02 — Epoch timer spawned only after all fallible setup completes
+**File:** `crates/plugin-sandbox-wasmtime/src/lib.rs`
+**Was:** The background epoch-timer thread was spawned before any of the fallible
+setup steps (fuel config, linker instantiation, memory export check, etc.).
+On any early-return error the thread ran to completion and called
+`engine.increment_epoch()`, which corrupted the *next* call's relative epoch
+deadline, potentially causing it to trap immediately.
+**Fix:** The `std::thread::spawn` is now placed immediately before `run.call()`,
+after all fallible operations have succeeded.  The `cancel` flag is still set
+to `true` after the call returns so the timer is suppressed on completion.
+
+#### CR-03 — `parse_llm_output` scans all `{` positions, not just the first
+**File:** `src/pipeline.rs`
+**Was:** `text.find('{')` located the first `{` in the response.  If the model
+included prose with braces before the JSON object (e.g. `"involves {retry}. {…}"`)
+`serde_json::from_str` would fail on the prose brace and the task was
+incorrectly marked as blocked.
+**Fix:** The parser now iterates forward through every `{` position, attempting
+`serde_json::from_str` at each.  The first position that deserialises
+successfully as a valid `LlmResponse` is used; only if none succeeds is
+the response treated as unparseable.
+
+---
+
+### Efficiency fixes
+
+#### CR-05 — `SafeModule` carries a precomputed SHA-256; sandbox no longer re-hashes on cache hits
+**Files:** `crates/core/src/sandbox.rs`, `crates/plugin-sandbox-wasmtime/src/lib.rs`
+**Was:** `execute()` recomputed SHA-256 of the WASM bytes on every call to key
+the module cache, including all cache-hit calls.
+**Fix:** `SafeModule::new(wasm_bytes)` computes and stores `content_hash: [u8; 32]`
+once at construction.  `execute()` uses `module.content_hash` directly for the
+cache lookup.
+
+#### CR-06 — Epoch timer spawned after setup (also eliminates spurious early threads)
+*(Covered by CR-02 above.)*
+
+#### CR-07 — `is_valid()` checks the revocation set before computing HMAC
+**File:** `crates/core/src/security.rs`
+**Was:** `compute_mac(content)` (expensive HMAC-SHA256) ran before the O(1)
+`HashSet::contains` check.  Replayed invalidated stamps consumed full MAC work.
+**Fix:** The revocation-set check now runs first; HMAC is only computed for
+stamps not already revoked.
+
+---
+
+### Maintenance / simplification fixes
+
+#### CR-08 — `validate_db_path` moved to `wyrtloom-core::storage`
+**Files:** `crates/core/src/storage.rs` (new),
+           `crates/plugin-kanban-sqlite/src/lib.rs`,
+           `crates/plugin-logger-sqlite/src/lib.rs`
+**Was:** Identical nine-line path-traversal validation functions were duplicated
+in both SQLite plugins.  A future fix to this security-critical check would have
+had to be applied in two places.
+**Fix:** `wyrtloom_core::storage::validate_db_path` is the single implementation;
+both plugins import it.
+
+#### CR-09 — `is_allowed()` extracts a shared `check_file_path` helper
+**File:** `crates/core/src/security.rs`
+**Was:** The path validation block (`!path.contains("..")` + prefix check) was
+copy-pasted for `FileRead` and `FileWrite` capabilities — divergence risk if
+either branch was hardened independently.
+**Fix:** Both match arms delegate to `check_file_path(path, prefixes)`.
+
+#### CR-10 — `Pipeline::make_call_log` eliminates duplicate `CallLog` construction
+**Files:** `src/pipeline.rs`, `crates/core/src/profile.rs`
+**Was:** `CallLog` was constructed with duplicated field-by-field code in both
+the `Ok` and `Err` branches of the LLM call, with `"ollama"` hardcoded in both.
+**Fix:** `Pipeline::make_call_log(task_id, usage, outcome)` is a single helper.
+`TaskProfile` gains a `provider: String` field (defaults to `"ollama"` in
+`default_v01()`) so the provider name is sourced from the profile rather than
+hardcoded.
+
+---
+
 ## Security hardening — post-audit fixes (2026-06-07)
 
 All 22 findings from the internal security audit have been addressed.

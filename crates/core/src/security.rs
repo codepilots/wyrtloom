@@ -224,11 +224,13 @@ impl SecurityModule {
     /// Verify that a stamp is valid for the given content and has not been
     /// explicitly invalidated.  Returns false on MAC mismatch or revocation.
     pub fn is_valid(&self, stamp: &Stamp, content: &[u8]) -> bool {
-        let expected = self.compute_mac(content);
-        if stamp.0 != expected {
+        // Check the O(1) revocation set first to short-circuit expensive MAC work
+        // on replayed invalidated stamps.
+        if self.invalidated.lock().unwrap().contains(stamp) {
             return false;
         }
-        !self.invalidated.lock().unwrap().contains(stamp)
+        let expected = self.compute_mac(content);
+        stamp.0 == expected
     }
 
     /// Invalidate a stamp when the message it covers is transformed.
@@ -253,31 +255,37 @@ impl SecurityModule {
 
     fn is_allowed(&self, cap: &Capability) -> bool {
         match cap {
-            Capability::FileRead(path) => {
-                !path.contains("..") && self.policy.file_read_prefixes
-                    .iter().any(|p| path.starts_with(p.as_str()))
-            }
-            Capability::FileWrite(path) => {
-                !path.contains("..") && self.policy.file_write_prefixes
-                    .iter().any(|p| path.starts_with(p.as_str()))
-            }
+            Capability::FileRead(path)  => self.check_file_path(path, &self.policy.file_read_prefixes),
+            Capability::FileWrite(path) => self.check_file_path(path, &self.policy.file_write_prefixes),
             Capability::Network(host) => {
-                self.policy.network_allowlist
-                    .iter().any(|allowed| host == allowed || host.ends_with(allowed.as_str()))
+                self.policy.network_allowlist.iter().any(|allowed| {
+                    // Exact match or subdomain match — require a dot separator so
+                    // "evillocalhost" does not match the allowlist entry "localhost".
+                    host == allowed || host.ends_with(&format!(".{}", allowed))
+                })
             }
             Capability::Shell => self.policy.allow_shell,
             Capability::Git   => self.policy.allow_git,
         }
     }
 
-    fn audit(&self, kind: DecisionKind, detail: String) {
-        let prev_hash = self.last_hash.lock().unwrap().clone();
-        let entry = SecurityDecision { kind, detail, at: Timestamp::now(), prev_hash };
+    fn check_file_path(&self, path: &str, prefixes: &[String]) -> bool {
+        !path.contains("..") && prefixes.iter().any(|p| path.starts_with(p.as_str()))
+    }
 
-        // Compute hash of this entry and store as the new chain tip.
-        let serialized = serde_json::to_string(&entry).unwrap_or_default();
-        let new_hash = sha256_hex(serialized.as_bytes());
-        *self.last_hash.lock().unwrap() = new_hash;
+    fn audit(&self, kind: DecisionKind, detail: String) {
+        // Hold last_hash across the entire read-compute-write to prevent concurrent
+        // audit() calls from reading the same prev_hash and forking the chain.
+        let entry;
+        let serialized;
+        {
+            let mut last = self.last_hash.lock().unwrap();
+            entry = SecurityDecision {
+                kind, detail, at: Timestamp::now(), prev_hash: last.clone(),
+            };
+            serialized = serde_json::to_string(&entry).unwrap_or_default();
+            *last = sha256_hex(serialized.as_bytes());
+        } // last_hash lock released; I/O and log push happen outside.
 
         // Optionally persist to file before touching in-memory log.
         if let Some(file_lock) = &self.audit_file {

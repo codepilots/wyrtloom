@@ -41,19 +41,24 @@ struct LlmResponse {
 
 /// Parse the LLM's structured JSON output.
 /// Returns Ok((is_blocked, content)) or Err(parse_error_description).
+///
+/// Scans forward through all '{' positions so that prose containing braces
+/// (e.g. "involves {retry logic}") before the actual JSON object does not
+/// cause a false parse failure.
 fn parse_llm_output(text: &str) -> Result<(bool, String), String> {
-    // Attempt to extract JSON from the response — the model may wrap it
-    // in Markdown code fences or leading prose, so we search for the first '{'.
-    let start = text.find('{').ok_or("no JSON object found in response")?;
-    let json_part = &text[start..];
-    let resp: LlmResponse = serde_json::from_str(json_part)
-        .map_err(|e| format!("JSON parse error: {}", e))?;
-
-    match resp.status.to_lowercase().as_str() {
-        "done"    => Ok((false, resp.result.unwrap_or_default())),
-        "blocked" => Ok((true,  resp.reason.unwrap_or_default())),
-        other     => Err(format!("unknown status field: '{}'", other)),
+    let mut search = text;
+    while let Some(offset) = search.find('{') {
+        let candidate = &search[offset..];
+        if let Ok(resp) = serde_json::from_str::<LlmResponse>(candidate) {
+            return match resp.status.to_lowercase().as_str() {
+                "done"    => Ok((false, resp.result.unwrap_or_default())),
+                "blocked" => Ok((true,  resp.reason.unwrap_or_default())),
+                other     => Err(format!("unknown status field: '{}'", other)),
+            };
+        }
+        search = &search[offset + 1..];
     }
+    Err("no valid JSON object found in response".into())
 }
 
 impl Pipeline {
@@ -120,17 +125,9 @@ impl Pipeline {
             Ok(resp) => {
                 let raw = resp.full_text();
                 eprintln!("[wyrtloom] LLM raw response: {}", raw);
-
-                let log = CallLog {
-                    task: task_id,
-                    profile: self.profile.id.clone(),
-                    provider: "ollama".into(),
-                    model: self.profile.model.clone(),
-                    usage: resp.usage,
-                    outcome: CallOutcome::Completed,
-                    at: Timestamp::now(),
-                };
-                self.logger.record(log).ok();
+                self.logger.record(self.make_call_log(
+                    task_id, resp.usage, CallOutcome::Completed,
+                )).ok();
 
                 // ── verify: parse structured JSON output (finding 008) ─────
                 match parse_llm_output(&raw) {
@@ -145,20 +142,11 @@ impl Pipeline {
             Err(e) => {
                 let reason = e.to_string();
                 eprintln!("[wyrtloom] LLM error: {}", reason);
-                let log = CallLog {
-                    task: task_id,
-                    profile: self.profile.id.clone(),
-                    provider: "ollama".into(),
-                    model: self.profile.model.clone(),
-                    usage: wyrtloom_core::provider::Usage {
-                        input_tokens: 0,
-                        output_tokens: 0,
-                        cost: None,
-                    },
-                    outcome: CallOutcome::Failed(reason.clone()),
-                    at: Timestamp::now(),
-                };
-                self.logger.record(log).ok();
+                self.logger.record(self.make_call_log(
+                    task_id,
+                    wyrtloom_core::provider::Usage { input_tokens: 0, output_tokens: 0, cost: None },
+                    CallOutcome::Failed(reason.clone()),
+                )).ok();
                 (true, reason)
             }
         };
@@ -229,6 +217,23 @@ impl Pipeline {
             Err(_) => {
                 self.record_blocked(task_id, "escalation failed".into())
             }
+        }
+    }
+
+    fn make_call_log(
+        &self,
+        task_id: TaskId,
+        usage: wyrtloom_core::provider::Usage,
+        outcome: CallOutcome,
+    ) -> CallLog {
+        CallLog {
+            task: task_id,
+            profile: self.profile.id.clone(),
+            provider: self.profile.provider.clone(),
+            model: self.profile.model.clone(),
+            usage,
+            outcome,
+            at: Timestamp::now(),
         }
     }
 

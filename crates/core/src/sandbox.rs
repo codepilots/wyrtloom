@@ -15,8 +15,20 @@ impl Default for ResourceLimits {
 }
 
 /// Opaque handle to a compiled safe WASM module.
+/// The `content_hash` is the SHA-256 of `wasm_bytes`, computed once at
+/// construction so the sandbox can key its module cache without re-hashing.
 pub struct SafeModule {
     pub wasm_bytes: Bytes,
+    pub content_hash: [u8; 32],
+}
+
+impl SafeModule {
+    pub fn new(wasm_bytes: Bytes) -> Self {
+        use sha2::Digest;
+        let mut h = sha2::Sha256::new();
+        h.update(&wasm_bytes);
+        Self { wasm_bytes, content_hash: h.finalize().into() }
+    }
 }
 
 #[derive(Error, Debug)]

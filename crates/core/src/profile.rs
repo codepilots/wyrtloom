@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskProfile {
     pub id: ProfileId,
+    /// Provider name recorded in call logs (e.g. "ollama", "openai").
+    pub provider: String,
     pub model: ModelId,
     pub max_output_tokens: u32,
     pub system_prompt: String,
@@ -32,6 +34,7 @@ impl TaskProfile {
     pub fn default_v01() -> Self {
         Self {
             id: "default".into(),
+            provider: "ollama".into(),
             model: "llama3.2".into(),
             max_output_tokens: 512,
             // Structured JSON output format prevents prompt injection from

@@ -9,4 +9,5 @@ pub mod profile;
 pub mod provider;
 pub mod sandbox;
 pub mod security;
+pub mod storage;
 pub mod types;

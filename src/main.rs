@@ -108,7 +108,7 @@ fn main() -> anyhow::Result<()> {
 )
 "#;
     let wasm_bytes = wat::parse_str(wat_ok)?;
-    let result = sandbox.execute(SafeModule { wasm_bytes }, vec![], ResourceLimits::default());
+    let result = sandbox.execute(SafeModule::new(wasm_bytes), vec![], ResourceLimits::default());
     println!("[sandbox] SAFE module executed, result ok = {}", result.is_ok());
 
     let bad_wat = r#"
@@ -120,7 +120,7 @@ fn main() -> anyhow::Result<()> {
 "#;
     let bad_wasm = wat::parse_str(bad_wat)?;
     let isolation_result = sandbox.execute(
-        SafeModule { wasm_bytes: bad_wasm }, vec![], ResourceLimits::default(),
+        SafeModule::new(bad_wasm), vec![], ResourceLimits::default(),
     );
     println!(
         "[sandbox] Module with host import isolated = {}",
