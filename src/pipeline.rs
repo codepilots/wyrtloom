@@ -196,8 +196,25 @@ impl Pipeline {
                     messages.push(Message::user(format!("Human guidance: {}", text)));
                     continue;
                 }
-                // Unknown option, escalation failure, or retries exhausted.
-                _ => return self.record_blocked(task_id, content),
+                // Retries exhausted: the guards above failed because attempt has
+                // hit MAX_ATTEMPTS.  Record a reason that distinguishes this from
+                // a never-escalated block.
+                Resolution::Retry | Resolution::Guidance(_) => {
+                    return self.record_blocked(
+                        task_id,
+                        format!(
+                            "retry budget exhausted after {} attempts; last reason: {}",
+                            attempt, content
+                        ),
+                    );
+                }
+                // Escalation failed or the human gave an unrecognised response.
+                Resolution::Abandon => {
+                    return self.record_blocked(
+                        task_id,
+                        format!("escalation produced no actionable response; agent reason: {}", content),
+                    );
+                }
             }
         }
     }

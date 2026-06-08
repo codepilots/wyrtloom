@@ -192,24 +192,28 @@ fn transition_inner(
         }
     }
 
-    // C4: only clear the actor when the task returns to an *unclaimed* pool state
-    // (Backlog/Todo/Ready).  Previously every transition nulled the actor, so the
-    // owner established by claim() was wiped by the very next Ready→Running move,
-    // leaving Running tasks with no recorded owner.
-    let clears_actor = matches!(
-        to,
-        TaskState::Backlog | TaskState::Todo | TaskState::Ready
-    );
-    if clears_actor {
-        conn.execute(
+    // C4: keep the actor column in sync with who actually owns the task.
+    //   • Returning to an *unclaimed* pool state (Backlog/Todo/Ready) clears it,
+    //     so the task can be re-claimed.  Previously every transition nulled the
+    //     actor, wiping the claim() owner on the very next Ready→Running move.
+    //   • Moving INTO Running records the transitioning actor as the owner, so a
+    //     resume (e.g. Blocked→Running by a different worker) reflects who is now
+    //     running it rather than preserving a stale owner.
+    //   • Other terminal/holding states (Blocked/Done/Archived) preserve the
+    //     existing owner.
+    match to {
+        TaskState::Backlog | TaskState::Todo | TaskState::Ready => conn.execute(
             "UPDATE tasks SET state = ?1, actor = NULL WHERE id = ?2",
             params![format!("{:?}", to), id.to_string()],
-        )
-    } else {
-        conn.execute(
+        ),
+        TaskState::Running => conn.execute(
+            "UPDATE tasks SET state = ?1, actor = ?2 WHERE id = ?3",
+            params![format!("{:?}", to), actor, id.to_string()],
+        ),
+        _ => conn.execute(
             "UPDATE tasks SET state = ?1 WHERE id = ?2",
             params![format!("{:?}", to), id.to_string()],
-        )
+        ),
     }
     .map_err(|e| KanbanError::Storage(format!("update failed (code {})", sqlite_code(&e))))?;
 
@@ -451,6 +455,28 @@ mod tests {
         b.transition(id, TaskState::Running, "agent:w".into(), None).unwrap();
         b.transition(id, TaskState::Todo, "agent:w".into(), None).unwrap();
         assert_eq!(b.get(id).unwrap().actor, None);
+    }
+
+    // C4 — resuming a blocked task records the resumer as the owner, not a stale one.
+    #[test]
+    fn blocked_to_running_records_resuming_actor() {
+        let b = board();
+        let id = b.create(new_task("t")).unwrap();
+        b.transition(id, TaskState::Todo, "a".into(), None).unwrap();
+        b.transition(id, TaskState::Ready, "a".into(), None).unwrap();
+        b.claim(id, "agent:a".into()).unwrap();
+        b.transition(id, TaskState::Running, "agent:a".into(), None).unwrap();
+        b.block(
+            id,
+            "agent:a".into(),
+            BlockReason {
+                reason: "waiting".into(),
+                blocked_by: BlockedBy::Human("human:cli".into()),
+            },
+        ).unwrap();
+        // A different worker resumes it.
+        b.transition(id, TaskState::Running, "agent:b".into(), None).unwrap();
+        assert_eq!(b.get(id).unwrap().actor.as_deref(), Some("agent:b"));
     }
 
     #[test]

@@ -55,10 +55,6 @@ impl SandboxRuntime for WasmtimeSandbox {
         input: Bytes,
         limits: ResourceLimits,
     ) -> Result<Bytes, SandboxError> {
-        // C1 — serialise executions; held for the whole call so the timeout's
-        // engine-global epoch increment only affects this execution's store.
-        let _exec = self.exec_lock.lock().unwrap();
-
         // 012 — bounds-check before i32 cast.
         if input.len() > i32::MAX as usize {
             return Err(SandboxError::Trap(format!(
@@ -69,6 +65,8 @@ impl SandboxRuntime for WasmtimeSandbox {
 
         // 014 — look up or compile the module using the precomputed hash from
         // SafeModule::new(), avoiding a full SHA-256 on every cache-hit call.
+        // Compilation (the expensive Cranelift path) runs WITHOUT the exec lock so
+        // independent modules can still compile concurrently.
         let compiled = {
             let mut cache = self.module_cache.lock().unwrap();
             if let Some(m) = cache.get(&module.content_hash) {
@@ -80,6 +78,13 @@ impl SandboxRuntime for WasmtimeSandbox {
                 m
             }
         };
+
+        // C1 — serialise only the epoch-sensitive window (store setup through the
+        // timed `run.call`).  The wall-clock timeout increments the engine-global
+        // epoch; holding this from before `set_epoch_deadline` until the call
+        // returns ensures a timer fired for this execution cannot trap another's
+        // store.  Compilation above is deliberately left outside the lock.
+        let _exec = self.exec_lock.lock().unwrap();
 
         // M1 — enforce the memory cap via a per-store ResourceLimiter so the
         // module cannot grow linear memory beyond limits.max_memory_bytes.

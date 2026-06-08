@@ -120,14 +120,30 @@ fn is_disallowed_v4(ip: &Ipv4Addr) -> bool {
         || ip.is_link_local() // 169.254.0.0/16 — cloud instance metadata
         || ip.is_unspecified()
         || ip.is_broadcast()
+        || ip.is_multicast() // 224.0.0.0/4
+        || is_cgnat_v4(ip) // 100.64.0.0/10 — carrier-grade NAT shared space
+}
+
+/// 100.64.0.0/10 (RFC 6598). Not exposed by stable std (`Ipv4Addr::is_shared`
+/// is unstable), so matched directly: first octet 100, second octet 64–127.
+fn is_cgnat_v4(ip: &Ipv4Addr) -> bool {
+    let o = ip.octets();
+    o[0] == 100 && (o[1] & 0xc0) == 0x40
 }
 
 fn is_disallowed_v6(ip: &Ipv6Addr) -> bool {
-    let first = ip.segments()[0];
-    ip.is_loopback()
-        || ip.is_unspecified()
-        || (first & 0xfe00) == 0xfc00 // unique-local fc00::/7
-        || (first & 0xffc0) == 0xfe80 // link-local fe80::/10
+    if ip.is_loopback() || ip.is_unspecified() {
+        return true;
+    }
+    // IPv4-mapped (`::ffff:a.b.c.d`) and IPv4-compatible (`::a.b.c.d`) literals
+    // must be judged by their embedded IPv4 address — otherwise the private/IMDS
+    // block is trivially bypassed with a bracketed IPv6 host such as
+    // `https://[::ffff:169.254.169.254]`, which `url` parses as Host::Ipv6.
+    if let Some(v4) = ip.to_ipv4() {
+        return is_disallowed_v4(&v4);
+    }
+    ip.is_unique_local() // fc00::/7
+        || ip.is_unicast_link_local() // fe80::/10
 }
 
 /// Strip ANSI escape sequences and other control characters from a string
@@ -306,6 +322,35 @@ mod tests {
         assert!(OllamaProvider::new("https://10.0.0.1/").is_err());
         assert!(OllamaProvider::new("https://192.168.1.1/").is_err());
         assert!(OllamaProvider::new("https://[::1]/").is_err());
+    }
+
+    // S1 — IPv4-mapped/compatible IPv6 literals must not bypass the IMDS/private
+    // block (url parses these as Host::Ipv6, not Ipv4).
+    #[test]
+    fn https_to_ipv4_mapped_ipv6_is_rejected() {
+        assert!(OllamaProvider::new("https://[::ffff:169.254.169.254]/latest").is_err());
+        assert!(OllamaProvider::new("https://[::ffff:10.0.0.1]/").is_err());
+        assert!(OllamaProvider::new("https://[::ffff:127.0.0.1]/").is_err());
+    }
+
+    // S1 — decimal/octal/hex IP encodings are normalised to Ipv4 by url and blocked.
+    #[test]
+    fn https_to_encoded_loopback_is_rejected() {
+        assert!(OllamaProvider::new("https://2130706433/").is_err()); // 127.0.0.1
+        assert!(OllamaProvider::new("https://0x7f000001/").is_err());
+    }
+
+    // S1 — CGNAT and multicast ranges are internal/non-routable; block over https.
+    #[test]
+    fn https_to_cgnat_and_multicast_is_rejected() {
+        assert!(OllamaProvider::new("https://100.64.0.1/").is_err()); // RFC 6598
+        assert!(OllamaProvider::new("https://224.0.0.1/").is_err()); // multicast
+    }
+
+    // A legitimate public mapped address is still allowed.
+    #[test]
+    fn https_to_public_mapped_ipv6_is_accepted() {
+        assert!(OllamaProvider::new("https://[::ffff:8.8.8.8]/").is_ok());
     }
 
     #[test]

@@ -2,6 +2,32 @@
 
 ---
 
+## Review follow-up fixes (2026-06-08)
+
+A second review pass over the fixes above caught issues the first pass missed —
+including a real SSRF gap in the S1 fix itself. Test count 120 → 125; clippy clean.
+
+- **S1-bis — IPv4-mapped IPv6 SSRF bypass.**
+  `crates/plugin-provider-ollama/src/lib.rs`. `is_disallowed_v6` only inspected
+  the first segment, so `https://[::ffff:169.254.169.254]` (cloud IMDS) and other
+  IPv4-mapped/compatible literals — which `url` parses as `Host::Ipv6` — slipped
+  through. It now judges any embedded IPv4 via `to_ipv4()` and uses the stable
+  `is_unique_local()`/`is_unicast_link_local()` helpers. Also extended the v4
+  block to multicast (224.0.0.0/4) and CGNAT (100.64.0.0/10). Verified that
+  decimal/octal/hex IP encodings are already normalised to `Ipv4` by `url` and
+  blocked.
+- **C4-bis — `Blocked→Running` recorded a stale owner.** `transition` now sets
+  the actor to the transitioning worker when moving into `Running`, so a resume
+  reflects who is running the task rather than preserving the previous owner.
+- **Pipeline diagnostics.** Retry-budget exhaustion and escalation failure now
+  record distinct block reasons instead of collapsing into one generic message;
+  the redundant `_` match arm was replaced with explicit `Resolution` arms.
+- **Sandbox lock scope.** The `exec_lock` no longer covers Cranelift
+  compilation — only the epoch-sensitive store-setup-through-`run.call` window —
+  so independent modules can still compile concurrently.
+
+---
+
 ## Second code-review fixes (2026-06-07)
 
 A follow-up review surfaced findings that survived the earlier hardening passes;
