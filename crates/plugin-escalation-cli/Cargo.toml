@@ -1,0 +1,10 @@
+[package]
+name    = "plugin-escalation-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+wyrtloom-core = { workspace = true }
+thiserror     = { workspace = true }
+uuid          = { workspace = true }
