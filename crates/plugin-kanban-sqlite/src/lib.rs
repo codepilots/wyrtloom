@@ -192,10 +192,29 @@ fn transition_inner(
         }
     }
 
-    conn.execute(
-        "UPDATE tasks SET state = ?1, actor = NULL WHERE id = ?2",
-        params![format!("{:?}", to), id.to_string()],
-    )
+    // C4: keep the actor column in sync with who actually owns the task.
+    //   • Returning to an *unclaimed* pool state (Backlog/Todo/Ready) clears it,
+    //     so the task can be re-claimed.  Previously every transition nulled the
+    //     actor, wiping the claim() owner on the very next Ready→Running move.
+    //   • Moving INTO Running records the transitioning actor as the owner, so a
+    //     resume (e.g. Blocked→Running by a different worker) reflects who is now
+    //     running it rather than preserving a stale owner.
+    //   • Other terminal/holding states (Blocked/Done/Archived) preserve the
+    //     existing owner.
+    match to {
+        TaskState::Backlog | TaskState::Todo | TaskState::Ready => conn.execute(
+            "UPDATE tasks SET state = ?1, actor = NULL WHERE id = ?2",
+            params![format!("{:?}", to), id.to_string()],
+        ),
+        TaskState::Running => conn.execute(
+            "UPDATE tasks SET state = ?1, actor = ?2 WHERE id = ?3",
+            params![format!("{:?}", to), actor, id.to_string()],
+        ),
+        _ => conn.execute(
+            "UPDATE tasks SET state = ?1 WHERE id = ?2",
+            params![format!("{:?}", to), id.to_string()],
+        ),
+    }
     .map_err(|e| KanbanError::Storage(format!("update failed (code {})", sqlite_code(&e))))?;
 
     conn.execute(
@@ -273,7 +292,7 @@ fn get_inner(conn: &Connection, id: TaskId) -> Result<Task, KanbanError> {
 
     let block_reason: Option<BlockReason> = block_json
         .as_deref()
-        .map(|s| serde_json::from_str(s))
+        .map(serde_json::from_str)
         .transpose()
         .map_err(|_| KanbanError::Storage("integrity error: malformed block_reason".into()))?;
 
@@ -409,6 +428,55 @@ mod tests {
         let task = b.get(id).unwrap();
         assert_eq!(task.state, TaskState::Blocked);
         assert!(task.block_reason.is_some());
+    }
+
+    // C4 — the claiming worker remains the owner after Ready→Running.
+    #[test]
+    fn claim_owner_survives_running_transition() {
+        let b = board();
+        let id = b.create(new_task("t")).unwrap();
+        b.transition(id, TaskState::Todo, "a".into(), None).unwrap();
+        b.transition(id, TaskState::Ready, "a".into(), None).unwrap();
+        b.claim(id, "agent:w".into()).unwrap();
+        b.transition(id, TaskState::Running, "agent:w".into(), None).unwrap();
+        let task = b.get(id).unwrap();
+        assert_eq!(task.state, TaskState::Running);
+        assert_eq!(task.actor.as_deref(), Some("agent:w"));
+    }
+
+    // C4 — returning a task to the pool clears the owner so it can be re-claimed.
+    #[test]
+    fn returning_to_todo_clears_actor() {
+        let b = board();
+        let id = b.create(new_task("t")).unwrap();
+        b.transition(id, TaskState::Todo, "a".into(), None).unwrap();
+        b.transition(id, TaskState::Ready, "a".into(), None).unwrap();
+        b.claim(id, "agent:w".into()).unwrap();
+        b.transition(id, TaskState::Running, "agent:w".into(), None).unwrap();
+        b.transition(id, TaskState::Todo, "agent:w".into(), None).unwrap();
+        assert_eq!(b.get(id).unwrap().actor, None);
+    }
+
+    // C4 — resuming a blocked task records the resumer as the owner, not a stale one.
+    #[test]
+    fn blocked_to_running_records_resuming_actor() {
+        let b = board();
+        let id = b.create(new_task("t")).unwrap();
+        b.transition(id, TaskState::Todo, "a".into(), None).unwrap();
+        b.transition(id, TaskState::Ready, "a".into(), None).unwrap();
+        b.claim(id, "agent:a".into()).unwrap();
+        b.transition(id, TaskState::Running, "agent:a".into(), None).unwrap();
+        b.block(
+            id,
+            "agent:a".into(),
+            BlockReason {
+                reason: "waiting".into(),
+                blocked_by: BlockedBy::Human("human:cli".into()),
+            },
+        ).unwrap();
+        // A different worker resumes it.
+        b.transition(id, TaskState::Running, "agent:b".into(), None).unwrap();
+        assert_eq!(b.get(id).unwrap().actor.as_deref(), Some("agent:b"));
     }
 
     #[test]

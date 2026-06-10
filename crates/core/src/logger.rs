@@ -36,7 +36,6 @@ pub trait CallLogger: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::Money;
     use crate::provider::Usage;
     use uuid::Uuid;
 
