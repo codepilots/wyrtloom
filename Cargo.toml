@@ -7,6 +7,8 @@ members = [
     "crates/plugin-logger-sqlite",
     "crates/plugin-escalation-cli",
     "crates/plugin-bus-tokio",
+    "crates/plugin-workflow-conversation",
+    "crates/plugin-workflow-sqlite",
     ".",
 ]
 resolver = "2"
@@ -47,6 +49,8 @@ plugin-sandbox-wasmtime     = { path = "crates/plugin-sandbox-wasmtime" }
 plugin-logger-sqlite        = { path = "crates/plugin-logger-sqlite" }
 plugin-escalation-cli       = { path = "crates/plugin-escalation-cli" }
 plugin-bus-tokio             = { path = "crates/plugin-bus-tokio" }
+plugin-workflow-conversation = { path = "crates/plugin-workflow-conversation" }
+plugin-workflow-sqlite       = { path = "crates/plugin-workflow-sqlite" }
 tokio.workspace     = true
 anyhow.workspace    = true
 chrono.workspace    = true

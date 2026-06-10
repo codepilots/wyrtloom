@@ -2,6 +2,132 @@
 
 ---
 
+## Derived traces, behavioural baseline, pilot instrumentation (2026-06-10)
+
+Closes the remaining seams in the comprehension-first workflow, plus a
+real README.
+
+**Derived execution traces (CG-6)** — `CoverageMap` gains the
+artifact→concept reverse lookup (`concepts_for_artifacts`) and
+`ExecutionTrace::from_artifacts` derives hunt traces from the artifacts a
+test exercised, looked up through the map's links, instead of
+caller-asserted concepts. An artifact nothing links to contributes
+nothing, so a test cannot claim credit on ground the map does not chart.
+Bytecode-level WASM call tracing can replace artifact declaration later
+without touching the crediting path.
+
+**Behavioural baseline interface** (`baseline.rs`) — the anomaly authority
+CG-20 and CG-25 reference. `RollingBaseline` keeps per-(component, metric)
+sample history with a deterministic k-sigma rule (3σ, minimum 5 samples;
+flat histories flag any departure). Recording and checking are separate so
+an anomaly burst cannot silently become the new normal. Wired in:
+`interest::detect_novelty` and `ProbeLadder::design_defect_signal_vs_baseline`.
+
+**Pilot instrumentation (§2.6)** (`pilot.rs`) — the measurement half of
+the evaluation plan, pre-registered rather than fitted afterwards:
+- gate passages are now timed digest-to-decision and the duration lands on
+  the audit event (`WorkflowEvent::duration_ms`);
+- `PilotInstruments` aggregates per-sprint gate overhead, defect/rework
+  counts, and suite growth, and implements the CH7 abandonment rule: N
+  consecutive over-budget sprints without defect-rate improvement → the
+  profile self-reports failure to the project owner;
+- `EquityWatch` disaggregates route-decline rates and hunt participation
+  by opaque cohort label — never per person — to surface learned-avoidance
+  patterns for review (part C gaps). CG-26's decline-without-record holds:
+  the counters carry no actor identity.
+
+README rewritten from a single line to an actual project page.
+Test count grew from 186 to 201; all pass.
+
+---
+
+## Workflow integration & persistence (2026-06-10)
+
+Two follow-ups that put the comprehension-first workflow into the live
+task loop:
+
+**Pipeline gating** (`src/pipeline.rs`) — `Pipeline` gains an optional
+`GatedWorkflow` (gate engine + workflow profile + reader). Every pipeline
+transition now goes through `advance()`: when the active profile guards
+that exact transition, passage runs through the gate engine — digest
+first, then the human's approval — and the approval is stamped into the
+board history by the reader, not the agent. Held gates block the task;
+a Stop at a gate stops it. The skip path in blocked-handling deliberately
+bypasses the ship gate: the human just made that decision through the
+escalation interface. Integration tests run the real in-memory SQLite
+board through both gates to Done, plus hold and stop paths.
+
+**SQLite persistence** (`crates/plugin-workflow-sqlite`) — a
+`SqliteWorkflowStore` persisting the coverage map, per-owner calibration
+ledgers, the regression suite, and the rationale ledger as governed-type
+snapshots. This is the storage layer CG-22 points at: retention limits
+are applied on every save and load, ledgers are stored and fetched one
+owner at a time (no cross-person scan or ranking query exists), owner
+delete reaches the stored bytes, paths are traversal-checked (010), and
+raw SQLite errors are mapped to opaque categories (022). Loaded state
+comes back as the same governed types, so owner-only access (CG-21)
+survives a reload.
+
+Registered both behaviours in the bootstrap; the demo now runs a *gated*
+pipeline task and round-trips coverage state through the store.
+Test count grew from 174 to 186; all pass.
+
+---
+
+## Comprehension-first workflow plugin (2026-06-10)
+
+Implements the specification addendum "The Conversation" (SoftDevSpec.md)
+as a new plugin-layer crate, `plugin-workflow-conversation`. Zero new core
+components: every mechanism composes the locked core contracts (kanban,
+escalation, logger, sandbox, agent messages). All gating, grading,
+crediting, scheduling, and routing logic is coded and deterministic — no
+LLM output decides anything (CG-4).
+
+Component inventory (W1–W13, §2.2), one module each:
+
+- **W1 Workflow profile** (`workflow.rs`) — stages as Kanban columns, gate
+  placement, per-stage task profiles, practice feature flags (§2.7).
+- **W2 Gate engine** (`gate.rs`) — guarded transitions; digest-before-
+  challenge ordering (CG-1); approval tokens carrying the blame-allocation
+  notice (CG-24).
+- **W3 Digest generator** (`digest.rs`) — instruction-first lessons with
+  the seductive-details guard (CG-2) and calibration-based fading (CG-3).
+- **W4 Hunt harness** (`hunt.rs`) — sandboxed human-authored breaking
+  tests (CG-5); trace ∩ map crediting regardless of outcome (CG-6); defect
+  → crystallisation lifecycle (CG-7); bounded stake escalation (CG-8); no
+  gamification fields anywhere (CG-9).
+- **W5 Probe ladder** (`probe.rs`) — execution-graded prediction probes,
+  scaffolds that never count toward mastery, staircase difficulty (CG-18);
+  dark-territory-only triggering per policy mode (CG-19); design-defect
+  signal on wrong-prediction-plus-anomaly (CG-20).
+- **W6 Coverage map** (`coverage.rs`) — concepts ↔ artifacts ↔ humans;
+  aggregate-only team views with no actor identifiers (CG-21).
+- **W7 Calibration ledger** (`calibration.rs`) — private-by-default,
+  retention-limited, owner export/delete, enforced at the storage layer
+  (CG-21/22); declared developmental purpose with no appraisal or ranking
+  API (CG-23).
+- **W8 Mastery policy** (`policy.rs`) — §2.4 schema;
+  `aggregate_only_team_views` locked true at the type level; redundant
+  assignment rejected as Phase 2; owner changes gated (D11).
+- **W9 Insight Artifacts** (`insight.rs`) — §2.5 schema; human-authored,
+  agent-captured, linkable, supersedable (CG-27).
+- **W10 Interest router** (`interest.rs`) — deterministic signals (CG-25),
+  flow-channel routing, decline-without-record (CG-26).
+- **W11 Withdrawal scheduler** (`withdrawal.rs`) — expanding-interval solo
+  flights (CG-13); agent-absence enforcement with logged, never-penalised
+  abort (CG-14); outcomes as practice events (CG-15).
+- **W12 Rotation scheduler** (`rotation.rs`) — deterministic role rotation
+  over the typed agent-message contracts (CG-16); human-only criticality
+  overrides (CG-17).
+- **W13 Rationale ledger** (`rationale.rs`) — ADR-shaped records.
+
+Build & Own quota selection (CG-10..12) lives in `build_own.rs`; CG-28
+audit events mirror onto the call-logger contract in `audit.rs`. `main.rs`
+registers the plugin (Safe class, no capabilities) and demos a gated
+passage. Test count grew from 103 to 174; all pass.
+
+---
+
 ## Code-review fixes (2026-06-07)
 
 Ten findings from an internal code review addressed.

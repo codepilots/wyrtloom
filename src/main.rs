@@ -82,6 +82,29 @@ fn main() -> anyhow::Result<()> {
         },
         || Arc::new(()),
     );
+    // Comprehension-first workflow (SoftDevSpec.md addendum): a pure
+    // plugin-layer construct that composes the locked core contracts —
+    // it implements no core contract of its own and needs no capability.
+    bootstrapper.register_plugin(
+        PluginManifest {
+            name: "plugin-workflow-conversation".into(),
+            version: SemVer::new(0, 1, 0),
+            class: PluginClass::Safe,
+            capabilities: vec![],
+            implements: vec![],
+        },
+        || Arc::new(()),
+    );
+    bootstrapper.register_plugin(
+        PluginManifest {
+            name: "plugin-workflow-sqlite".into(),
+            version: SemVer::new(0, 1, 0),
+            class: PluginClass::Unsafe,
+            capabilities: vec![Capability::FileWrite(".".into())],
+            implements: vec![],
+        },
+        || Arc::new(()),
+    );
 
     let sys = bootstrapper.run().map_err(|e| anyhow::anyhow!("{}", e))?;
     println!("[boot] Security + all plugins verified ✓");
@@ -144,6 +167,7 @@ fn main() -> anyhow::Result<()> {
         escalation,
         profile:   TaskProfile::default_v01(),
         agent_id:  "agent:wyrtloom-v01".into(),
+        gating:    None,
     };
 
     let prompt = r#"What is 2 + 2? Answer with {"status":"done","result":"4"}"#;
@@ -162,6 +186,84 @@ fn main() -> anyhow::Result<()> {
     }
 
     println!("\n[logger] SQLite call logger recording every LLM call with tokens + cost.");
+
+    // ── Demo: comprehension-first workflow (SoftDevSpec addendum) ─────────────
+    println!("\n--- Comprehension workflow demo ---");
+    {
+        use plugin_escalation_cli::ScriptedEscalation;
+        use plugin_workflow_conversation::audit::WorkflowAudit;
+        use plugin_workflow_conversation::coverage::{Concept, CoverageMap, CreditSource};
+        use plugin_workflow_conversation::gate::GateEngine;
+        use plugin_workflow_conversation::workflow::WorkflowProfile;
+        use plugin_workflow_sqlite::SqliteWorkflowStore;
+        use pipeline::GatedWorkflow;
+
+        let mut profile = WorkflowProfile::conversation_v01("human:cli".into());
+        profile.gates[0].concepts_in_play.push(Concept {
+            id: "arithmetic-contract".into(),
+            component: "pipeline".into(),
+            summary: "the demo task's input/output contract".into(),
+        });
+        profile.validate().map_err(|e| anyhow::anyhow!("{}", e))?;
+        println!("[workflow] Profile '{}' validated: {} stages, {} gates", profile.id,
+                 profile.stages.len(), profile.gates.len());
+
+        // The same pipeline, now gated: Ready→Running and Running→Done pass
+        // through the gate engine — digest first, then the human's approval.
+        let gated_pipeline = Pipeline {
+            kanban:    kanban.clone(),
+            provider:  provider.clone(),
+            logger:    logger.clone(),
+            escalation: Arc::new(ScriptedEscalation::stop()),
+            profile:   TaskProfile::default_v01(),
+            agent_id:  "agent:wyrtloom-v01".into(),
+            gating: Some(GatedWorkflow {
+                engine: GateEngine {
+                    kanban: kanban.clone(),
+                    escalation: Arc::new(ScriptedEscalation::chose("approve")),
+                    audit: WorkflowAudit::new(logger.clone()),
+                },
+                profile,
+                reader: "human:cli".into(),
+                // No calibration history yet → richest digest form.
+                reader_calibration: 0.0,
+            }),
+        };
+
+        match gated_pipeline.run("gated-arithmetic-demo", prompt) {
+            PipelineOutcome::Done { task_id, result } => {
+                println!("[workflow] Gated task {} DONE: {}", task_id, result);
+            }
+            PipelineOutcome::Stopped { task_id } => {
+                println!("[workflow] Gated task {} STOPPED (gate or block)", task_id);
+            }
+            PipelineOutcome::Blocked { task_id, reason } => {
+                println!("[workflow] Gated task {} BLOCKED: {}", task_id, reason);
+            }
+        }
+
+        // Workflow state persists through the SQLite store.
+        let store = SqliteWorkflowStore::in_memory()?;
+        let mut coverage = CoverageMap::new();
+        coverage.add_concept(Concept {
+            id: "arithmetic-contract".into(),
+            component: "pipeline".into(),
+            summary: "the demo task's input/output contract".into(),
+        });
+        coverage.credit_from_trace(
+            &"human:cli".to_string(),
+            &["arithmetic-contract".into()],
+            CreditSource::Build(uuid::Uuid::new_v4()),
+            wyrtloom_core::types::Timestamp::now(),
+        );
+        store.save_coverage("demo", &coverage)?;
+        let reloaded = store.load_coverage("demo")?.expect("saved state must reload");
+        println!(
+            "[workflow] Coverage persisted and reloaded ✓ (redundancy on demo concept: {})",
+            reloaded.redundancy("arithmetic-contract")
+        );
+    }
+
     println!("\n🌿 Wyrtloom v0.1 boot complete.");
     Ok(())
 }
