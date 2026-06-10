@@ -31,7 +31,7 @@ pub struct CreditEvent {
     pub at: Timestamp,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ArtifactRef {
     Code(String),
     Test(String),
@@ -78,6 +78,22 @@ impl CoverageMap {
 
     pub fn links(&self, concept: &str) -> &[ArtifactRef] {
         self.links.get(concept).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    /// Reverse lookup: every concept linked to any of the given artifacts,
+    /// in deterministic (sorted) order. This is how execution traces are
+    /// derived from what a test actually touched (CG-6) — artifacts with no
+    /// link contribute nothing.
+    pub fn concepts_for_artifacts(&self, artifacts: &[ArtifactRef]) -> Vec<ConceptId> {
+        let mut out: Vec<ConceptId> = self
+            .links
+            .iter()
+            .filter(|(_, refs)| refs.iter().any(|r| artifacts.contains(r)))
+            .map(|(concept, _)| concept.clone())
+            .collect();
+        out.sort();
+        out.dedup();
+        out
     }
 
     /// Deterministic crediting (CG-6): the exercised execution trace

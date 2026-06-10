@@ -113,6 +113,17 @@ impl ProbeLadder {
         )
     }
 
+    /// CG-20 against a live baseline: the anomaly half of the signal comes
+    /// from the behavioural baseline interface instead of a caller flag.
+    pub fn design_defect_signal_vs_baseline(
+        probe: &Probe,
+        prediction_passed: bool,
+        baseline: &dyn crate::baseline::BehaviouralBaseline,
+        observation: &crate::baseline::Observation,
+    ) -> Option<DesignDefectSignal> {
+        Self::design_defect_signal(probe, prediction_passed, baseline.is_anomalous(observation))
+    }
+
     pub fn design_defect_signal(
         probe: &Probe,
         prediction_passed: bool,
@@ -287,5 +298,26 @@ mod tests {
         assert!(ProbeLadder::design_defect_signal(&p, false, true).is_some());
         assert!(ProbeLadder::design_defect_signal(&p, false, false).is_none());
         assert!(ProbeLadder::design_defect_signal(&p, true, true).is_none());
+    }
+
+    #[test]
+    fn cg20_baseline_supplies_the_anomaly_half() {
+        use crate::baseline::{Observation, RollingBaseline};
+        let baseline = RollingBaseline::new();
+        for value in [10.0, 11.0, 9.0, 10.5, 9.5, 10.0] {
+            baseline.record(&Observation::new("parser", "latency_ms", value));
+        }
+        let p = probe(2);
+        let anomalous = Observation::new("parser", "latency_ms", 500.0);
+        let normal = Observation::new("parser", "latency_ms", 10.1);
+
+        assert!(
+            ProbeLadder::design_defect_signal_vs_baseline(&p, false, &baseline, &anomalous)
+                .is_some()
+        );
+        assert!(
+            ProbeLadder::design_defect_signal_vs_baseline(&p, false, &baseline, &normal)
+                .is_none()
+        );
     }
 }

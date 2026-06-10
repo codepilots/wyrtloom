@@ -31,6 +31,19 @@ pub struct RoutedProblem {
     pub recipient: ActorId,
 }
 
+/// CG-25: novelty against the behavioural baseline — the anomaly decision
+/// belongs to the baseline's deterministic rule, not to this router.
+pub fn detect_novelty(
+    baseline: &dyn crate::baseline::BehaviouralBaseline,
+    observation: &crate::baseline::Observation,
+) -> Option<InterestSignal> {
+    if baseline.is_anomalous(observation) {
+        Some(InterestSignal::NoveltyVsBaseline { observation: observation.describe() })
+    } else {
+        None
+    }
+}
+
 /// CG-25: retry/failure clusters read straight off the call log.
 pub fn detect_retry_clusters(logs: &[CallLog]) -> Vec<InterestSignal> {
     let mut failures: BTreeMap<TaskId, usize> = BTreeMap::new();
@@ -98,6 +111,21 @@ mod tests {
             signals[0],
             InterestSignal::RetryFailureCluster { task: stuck, failures: 3 }
         );
+    }
+
+    #[test]
+    fn cg25_novelty_signal_comes_from_the_baseline() {
+        use crate::baseline::{Observation, RollingBaseline};
+        let baseline = RollingBaseline::new();
+        for value in [10.0, 11.0, 9.0, 10.5, 9.5, 10.0] {
+            baseline.record(&Observation::new("parser", "latency_ms", value));
+        }
+        let odd = Observation::new("parser", "latency_ms", 500.0);
+        let normal = Observation::new("parser", "latency_ms", 10.1);
+
+        let signal = detect_novelty(&baseline, &odd).unwrap();
+        assert!(matches!(signal, InterestSignal::NoveltyVsBaseline { .. }));
+        assert!(detect_novelty(&baseline, &normal).is_none());
     }
 
     #[test]

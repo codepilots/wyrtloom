@@ -88,6 +88,10 @@ impl GateEngine {
             return Err(GateError::IllegalTransition(gate.from.clone(), gate.to.clone()));
         }
 
+        // Gate time cost is instrumented from here — digest generation
+        // through human decision — for the §2.6 economics pilot.
+        let started = std::time::Instant::now();
+
         // Lesson first (CG-1): the digest is generated unconditionally,
         // before any challenge is posed, with coherence and fading rules
         // applied (CG-2/3).
@@ -133,38 +137,42 @@ impl GateEngine {
                     at: Timestamp::now(),
                     blame_notice: BLAME_NOTICE.to_string(),
                 };
-                self.audit.record(
+                self.audit.record_timed(
                     WorkflowEventKind::Gate,
                     task,
                     reader,
                     &format!("gate '{}' approved", gate.id),
+                    Some(started.elapsed()),
                 );
                 Ok(GateOutcome::Approved { token, digest })
             }
             Ok(HumanResponse::Stop) => {
-                self.audit.record(
+                self.audit.record_timed(
                     WorkflowEventKind::Gate,
                     task,
                     reader,
                     &format!("gate '{}' stopped", gate.id),
+                    Some(started.elapsed()),
                 );
                 Ok(GateOutcome::Stopped)
             }
             Ok(HumanResponse::FreeText(text)) => {
-                self.audit.record(
+                self.audit.record_timed(
                     WorkflowEventKind::Gate,
                     task,
                     reader,
                     &format!("gate '{}' held: {}", gate.id, text),
+                    Some(started.elapsed()),
                 );
                 Ok(GateOutcome::Held { reason: text })
             }
             Ok(HumanResponse::Chose(_)) => {
-                self.audit.record(
+                self.audit.record_timed(
                     WorkflowEventKind::Gate,
                     task,
                     reader,
                     &format!("gate '{}' held", gate.id),
+                    Some(started.elapsed()),
                 );
                 Ok(GateOutcome::Held { reason: "held at the gate".into() })
             }
@@ -295,8 +303,11 @@ mod tests {
         let transitions = board.transitions.lock().unwrap();
         assert_eq!(transitions.len(), 1);
         assert_eq!(transitions[0], (task, TaskState::Running));
-        // CG-28: the gate event reached the audit trail.
-        assert_eq!(engine.audit.snapshot().len(), 1);
+        // CG-28: the gate event reached the audit trail, with the
+        // digest-to-decision duration measured for the §2.6 pilot.
+        let trail = engine.audit.snapshot();
+        assert_eq!(trail.len(), 1);
+        assert!(trail[0].duration_ms.is_some());
     }
 
     #[test]

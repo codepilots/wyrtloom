@@ -31,6 +31,21 @@ pub struct ExecutionTrace {
     pub concepts_exercised: Vec<ConceptId>,
 }
 
+impl ExecutionTrace {
+    /// Derive a trace from the artifacts a run exercised: concepts come
+    /// from the coverage map's artifact links, not from caller assertion.
+    /// An artifact nothing links to contributes nothing, so a test cannot
+    /// claim credit on ground the map does not chart. Bytecode-level WASM
+    /// call tracing can replace artifact declaration later without touching
+    /// the crediting path.
+    pub fn from_artifacts(
+        map: &CoverageMap,
+        exercised: &[crate::coverage::ArtifactRef],
+    ) -> Self {
+        Self { concepts_exercised: map.concepts_for_artifacts(exercised) }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DefectRecord {
     pub id: Uuid,
@@ -252,6 +267,37 @@ mod tests {
 
     fn policy() -> HuntPolicy {
         HuntPolicy { stake_escalation: true, max_ladder_depth: 3 }
+    }
+
+    #[test]
+    fn cg6_traces_derive_from_artifact_links_not_assertion() {
+        use crate::coverage::ArtifactRef;
+        let mut cov = coverage();
+        cov.link_artifact("tokeniser", ArtifactRef::Code("src/parser.rs".into()));
+
+        let trace = ExecutionTrace::from_artifacts(
+            &cov,
+            &[
+                ArtifactRef::Code("src/parser.rs".into()),
+                ArtifactRef::Code("src/unlinked.rs".into()),
+            ],
+        );
+        // Only linked artifacts yield concepts; the unlinked one is silent.
+        assert_eq!(trace.concepts_exercised, vec!["tokeniser".to_string()]);
+
+        // And the derived trace credits through the normal path.
+        let h = harness(Arc::new(EchoSandbox));
+        let report = h.run(
+            Uuid::new_v4(),
+            &test_case(),
+            SafeModule::new(vec![]),
+            &trace,
+            &mut cov,
+            &policy(),
+            0.5,
+            0,
+        );
+        assert_eq!(report.credited_concepts, vec!["tokeniser".to_string()]);
     }
 
     #[test]

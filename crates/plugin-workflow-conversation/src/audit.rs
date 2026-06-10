@@ -36,6 +36,10 @@ pub struct WorkflowEvent {
     pub actor: ActorId,
     pub detail: String,
     pub at: Timestamp,
+    /// Wall-clock cost of the event where it was measured (gate passages
+    /// time the digest-to-decision span) — raw material for the §2.6
+    /// economics instrumentation.
+    pub duration_ms: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -56,12 +60,24 @@ impl WorkflowAudit {
         actor: &ActorId,
         detail: &str,
     ) {
+        self.record_timed(kind, task, actor, detail, None);
+    }
+
+    pub fn record_timed(
+        &self,
+        kind: WorkflowEventKind,
+        task: TaskId,
+        actor: &ActorId,
+        detail: &str,
+        duration: Option<std::time::Duration>,
+    ) {
         let event = WorkflowEvent {
             kind,
             task,
             actor: actor.clone(),
             detail: detail.into(),
             at: Timestamp::now(),
+            duration_ms: duration.map(|d| d.as_millis() as u64),
         };
         // Mirror onto the call logger (CG-28). No LLM is involved; usage is
         // zero by definition.

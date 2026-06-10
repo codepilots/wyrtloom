@@ -32,12 +32,14 @@
 //!   CG-10..12 build_own.rs
 //!   CG-13..15 withdrawal.rs
 //!   CG-16..17 rotation.rs
-//!   CG-18..20 probe.rs
+//!   CG-18..20 probe.rs / baseline.rs
 //!   CG-21..24 calibration.rs / coverage.rs / policy.rs / gate.rs
-//!   CG-25..27 interest.rs / insight.rs
+//!   CG-25..27 interest.rs / insight.rs / baseline.rs
 //!   CG-28     audit.rs
+//!   §2.6      pilot.rs (evaluation-plan instrumentation)
 
 pub mod audit;
+pub mod baseline;
 pub mod build_own;
 pub mod calibration;
 pub mod coverage;
@@ -46,6 +48,7 @@ pub mod gate;
 pub mod hunt;
 pub mod insight;
 pub mod interest;
+pub mod pilot;
 pub mod policy;
 pub mod probe;
 pub mod rationale;

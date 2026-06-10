@@ -2,6 +2,45 @@
 
 ---
 
+## Derived traces, behavioural baseline, pilot instrumentation (2026-06-10)
+
+Closes the remaining seams in the comprehension-first workflow, plus a
+real README.
+
+**Derived execution traces (CG-6)** — `CoverageMap` gains the
+artifact→concept reverse lookup (`concepts_for_artifacts`) and
+`ExecutionTrace::from_artifacts` derives hunt traces from the artifacts a
+test exercised, looked up through the map's links, instead of
+caller-asserted concepts. An artifact nothing links to contributes
+nothing, so a test cannot claim credit on ground the map does not chart.
+Bytecode-level WASM call tracing can replace artifact declaration later
+without touching the crediting path.
+
+**Behavioural baseline interface** (`baseline.rs`) — the anomaly authority
+CG-20 and CG-25 reference. `RollingBaseline` keeps per-(component, metric)
+sample history with a deterministic k-sigma rule (3σ, minimum 5 samples;
+flat histories flag any departure). Recording and checking are separate so
+an anomaly burst cannot silently become the new normal. Wired in:
+`interest::detect_novelty` and `ProbeLadder::design_defect_signal_vs_baseline`.
+
+**Pilot instrumentation (§2.6)** (`pilot.rs`) — the measurement half of
+the evaluation plan, pre-registered rather than fitted afterwards:
+- gate passages are now timed digest-to-decision and the duration lands on
+  the audit event (`WorkflowEvent::duration_ms`);
+- `PilotInstruments` aggregates per-sprint gate overhead, defect/rework
+  counts, and suite growth, and implements the CH7 abandonment rule: N
+  consecutive over-budget sprints without defect-rate improvement → the
+  profile self-reports failure to the project owner;
+- `EquityWatch` disaggregates route-decline rates and hunt participation
+  by opaque cohort label — never per person — to surface learned-avoidance
+  patterns for review (part C gaps). CG-26's decline-without-record holds:
+  the counters carry no actor identity.
+
+README rewritten from a single line to an actual project page.
+Test count grew from 186 to 201; all pass.
+
+---
+
 ## Workflow integration & persistence (2026-06-10)
 
 Two follow-ups that put the comprehension-first workflow into the live
