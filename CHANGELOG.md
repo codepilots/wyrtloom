@@ -2,6 +2,39 @@
 
 ---
 
+## Workflow integration & persistence (2026-06-10)
+
+Two follow-ups that put the comprehension-first workflow into the live
+task loop:
+
+**Pipeline gating** (`src/pipeline.rs`) — `Pipeline` gains an optional
+`GatedWorkflow` (gate engine + workflow profile + reader). Every pipeline
+transition now goes through `advance()`: when the active profile guards
+that exact transition, passage runs through the gate engine — digest
+first, then the human's approval — and the approval is stamped into the
+board history by the reader, not the agent. Held gates block the task;
+a Stop at a gate stops it. The skip path in blocked-handling deliberately
+bypasses the ship gate: the human just made that decision through the
+escalation interface. Integration tests run the real in-memory SQLite
+board through both gates to Done, plus hold and stop paths.
+
+**SQLite persistence** (`crates/plugin-workflow-sqlite`) — a
+`SqliteWorkflowStore` persisting the coverage map, per-owner calibration
+ledgers, the regression suite, and the rationale ledger as governed-type
+snapshots. This is the storage layer CG-22 points at: retention limits
+are applied on every save and load, ledgers are stored and fetched one
+owner at a time (no cross-person scan or ranking query exists), owner
+delete reaches the stored bytes, paths are traversal-checked (010), and
+raw SQLite errors are mapped to opaque categories (022). Loaded state
+comes back as the same governed types, so owner-only access (CG-21)
+survives a reload.
+
+Registered both behaviours in the bootstrap; the demo now runs a *gated*
+pipeline task and round-trips coverage state through the store.
+Test count grew from 174 to 186; all pass.
+
+---
+
 ## Comprehension-first workflow plugin (2026-06-10)
 
 Implements the specification addendum "The Conversation" (SoftDevSpec.md)

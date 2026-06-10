@@ -64,7 +64,7 @@ pub struct HuntReport {
 
 /// Crystallised tests — breaking tests join here on fix (CG-7), as do
 /// passed probes (§1.5).
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct RegressionSuite {
     pub crystallised_tests: Vec<Uuid>,
 }

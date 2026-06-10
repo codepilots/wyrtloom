@@ -8,6 +8,8 @@
 ///   018 – All kanban operations return Result; panics from .expect() are
 ///         replaced by proper error handling that records a failed log entry
 ///         and returns PipelineOutcome::Blocked instead of crashing.
+use plugin_workflow_conversation::gate::{GateEngine, GateOutcome};
+use plugin_workflow_conversation::workflow::WorkflowProfile;
 use std::sync::Arc;
 use wyrtloom_core::escalation::{ActionOption, Escalation, HumanEscalation, HumanResponse};
 use wyrtloom_core::kanban::{BlockReason, BlockedBy, KanbanBoard, NewTask, TaskState};
@@ -16,6 +18,19 @@ use wyrtloom_core::profile::TaskProfile;
 use wyrtloom_core::provider::{GenerationRequest, LlmProvider, Message};
 use wyrtloom_core::types::{ActorId, TaskId, Timestamp};
 
+/// Comprehension-first gating (SoftDevSpec addendum): when present, any
+/// pipeline transition matching a gate in the workflow profile goes through
+/// the gate engine — digest first, then the human's approval — instead of
+/// transitioning directly.
+pub struct GatedWorkflow {
+    pub engine: GateEngine,
+    pub profile: WorkflowProfile,
+    /// The human who reads digests and answers gates.
+    pub reader: ActorId,
+    /// Typically `CalibrationLedger::overall_score()` for the reader.
+    pub reader_calibration: f64,
+}
+
 pub struct Pipeline {
     pub kanban:     Arc<dyn KanbanBoard>,
     pub provider:   Arc<dyn LlmProvider>,
@@ -23,6 +38,14 @@ pub struct Pipeline {
     pub escalation: Arc<dyn HumanEscalation>,
     pub profile:    TaskProfile,
     pub agent_id:   ActorId,
+    pub gating:     Option<GatedWorkflow>,
+}
+
+/// Result of one pipeline transition, gated or direct.
+enum Advance {
+    Proceeded,
+    Held(String),
+    Stopped,
 }
 
 pub enum PipelineOutcome {
@@ -83,15 +106,23 @@ impl Pipeline {
         eprintln!("[wyrtloom] task {} created: {}", task_id, title);
 
         // backlog → todo → ready → claim → running
-        for (next_state, label) in [
-            (TaskState::Todo,    "todo"),
-            (TaskState::Ready,   "ready"),
+        // Every transition runs through advance(), which consults the
+        // workflow gates when gating is configured.
+        for (from, to, label) in [
+            (TaskState::Backlog, TaskState::Todo,  "todo"),
+            (TaskState::Todo,    TaskState::Ready, "ready"),
         ] {
-            if let Err(e) = self.kanban.transition(
-                task_id, next_state, self.agent_id.clone(), None
-            ) {
-                eprintln!("[wyrtloom] transition to {} failed: {}", label, e);
-                return self.record_blocked(task_id, format!("transition to {} failed", label));
+            match self.advance(task_id, from, to, None) {
+                Ok(Advance::Proceeded) => {}
+                Ok(Advance::Held(reason)) => {
+                    eprintln!("[wyrtloom] held at gate before {}: {}", label, reason);
+                    return self.record_blocked(task_id, format!("held at gate: {}", reason));
+                }
+                Ok(Advance::Stopped) => return self.record_stopped(task_id),
+                Err(e) => {
+                    eprintln!("[wyrtloom] transition to {} failed: {}", label, e);
+                    return self.record_blocked(task_id, format!("transition to {} failed", label));
+                }
             }
         }
 
@@ -100,11 +131,17 @@ impl Pipeline {
             return self.record_blocked(task_id, format!("claim failed: {}", e));
         }
 
-        if let Err(e) = self.kanban.transition(
-            task_id, TaskState::Running, self.agent_id.clone(), None
-        ) {
-            eprintln!("[wyrtloom] running transition failed: {}", e);
-            return self.record_blocked(task_id, "running transition failed".into());
+        match self.advance(task_id, TaskState::Ready, TaskState::Running, None) {
+            Ok(Advance::Proceeded) => {}
+            Ok(Advance::Held(reason)) => {
+                eprintln!("[wyrtloom] held at gate before running: {}", reason);
+                return self.record_blocked(task_id, format!("held at gate: {}", reason));
+            }
+            Ok(Advance::Stopped) => return self.record_stopped(task_id),
+            Err(e) => {
+                eprintln!("[wyrtloom] running transition failed: {}", e);
+                return self.record_blocked(task_id, "running transition failed".into());
+            }
         }
 
         eprintln!("[wyrtloom] task {} running", task_id);
@@ -157,13 +194,73 @@ impl Pipeline {
         }
 
         // ── success path ──────────────────────────────────────────────────────
-        if let Err(e) = self.kanban.transition(
-            task_id, TaskState::Done, self.agent_id.clone(), Some("completed".into())
-        ) {
-            eprintln!("[wyrtloom] done transition failed: {}", e);
+        match self.advance(task_id, TaskState::Running, TaskState::Done, Some("completed".into())) {
+            Ok(Advance::Proceeded) => {}
+            Ok(Advance::Held(reason)) => {
+                eprintln!("[wyrtloom] held at ship gate: {}", reason);
+                return self.record_blocked(task_id, format!("held at ship gate: {}", reason));
+            }
+            Ok(Advance::Stopped) => return self.record_stopped(task_id),
+            Err(e) => {
+                eprintln!("[wyrtloom] done transition failed: {}", e);
+            }
         }
         eprintln!("[wyrtloom] task {} done", task_id);
         PipelineOutcome::Done { task_id, result: content }
+    }
+
+    /// Move a task `from` → `to`. When a workflow gate guards this exact
+    /// transition, passage goes through the gate engine — the digest is
+    /// presented before the approval challenge, and the engine performs the
+    /// kanban transition itself on approval. Ungated transitions go straight
+    /// to the board.
+    fn advance(
+        &self,
+        task_id: TaskId,
+        from: TaskState,
+        to: TaskState,
+        reason: Option<String>,
+    ) -> Result<Advance, String> {
+        if let Some(gating) = &self.gating {
+            if let Some(gate) =
+                gating.profile.gates.iter().find(|g| g.from == from && g.to == to)
+            {
+                return match gating.engine.request_passage(
+                    task_id,
+                    gate,
+                    &gating.reader,
+                    gating.reader_calibration,
+                    &[],
+                    false,
+                ) {
+                    Ok(GateOutcome::Approved { .. }) => Ok(Advance::Proceeded),
+                    Ok(GateOutcome::Held { reason }) => Ok(Advance::Held(reason)),
+                    Ok(GateOutcome::Stopped) => Ok(Advance::Stopped),
+                    Err(e) => Err(e.to_string()),
+                };
+            }
+        }
+        self.kanban
+            .transition(task_id, to, self.agent_id.clone(), reason)
+            .map(|_| Advance::Proceeded)
+            .map_err(|e| e.to_string())
+    }
+
+    fn record_stopped(&self, task_id: TaskId) -> PipelineOutcome {
+        let human = self
+            .gating
+            .as_ref()
+            .map(|g| g.reader.clone())
+            .unwrap_or_else(|| "human:cli".into());
+        self.kanban.block(
+            task_id,
+            self.agent_id.clone(),
+            BlockReason {
+                reason: "stopped by human at gate".into(),
+                blocked_by: BlockedBy::Human(human),
+            },
+        ).ok();
+        PipelineOutcome::Stopped { task_id }
     }
 
     fn handle_blocked(&self, task_id: TaskId, title: &str, reason: String) -> PipelineOutcome {
@@ -206,6 +303,9 @@ impl Pipeline {
                 PipelineOutcome::Stopped { task_id }
             }
             Ok(HumanResponse::Chose(ref id)) if id == "skip" => {
+                // Skip bypasses the ship gate by design: the human just made
+                // this exact call through the escalation interface, and a
+                // second challenge would gate their own decision.
                 self.kanban.transition(
                     task_id, TaskState::Done, self.agent_id.clone(), Some("skipped".into())
                 ).ok();
@@ -247,5 +347,149 @@ impl Pipeline {
             },
         ).ok();
         PipelineOutcome::Blocked { task_id, reason }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use plugin_escalation_cli::ScriptedEscalation;
+    use plugin_kanban_sqlite::SqliteKanbanBoard;
+    use plugin_workflow_conversation::audit::{NoopCallLogger, WorkflowAudit};
+    use wyrtloom_core::provider::{
+        ContentBlock, GenerationResponse, ModelDescriptor, ProviderError, Usage,
+    };
+
+    /// A provider that always answers with the given text — no network.
+    struct ScriptedProvider(String);
+
+    impl LlmProvider for ScriptedProvider {
+        fn generate(&self, _req: GenerationRequest) -> Result<GenerationResponse, ProviderError> {
+            Ok(GenerationResponse {
+                content: vec![ContentBlock::Text(self.0.clone())],
+                usage: Usage { input_tokens: 1, output_tokens: 1, cost: None },
+            })
+        }
+        fn models(&self) -> Vec<ModelDescriptor> {
+            vec![]
+        }
+    }
+
+    const DONE_JSON: &str = r#"{"status":"done","result":"4"}"#;
+
+    fn pipeline(
+        board: Arc<SqliteKanbanBoard>,
+        gating: Option<GatedWorkflow>,
+    ) -> Pipeline {
+        Pipeline {
+            kanban: board,
+            provider: Arc::new(ScriptedProvider(DONE_JSON.into())),
+            logger: Arc::new(NoopCallLogger),
+            escalation: Arc::new(ScriptedEscalation::stop()),
+            profile: TaskProfile::default_v01(),
+            agent_id: "agent:test".into(),
+            gating,
+        }
+    }
+
+    fn gating(board: Arc<SqliteKanbanBoard>, gate_response: HumanResponse) -> GatedWorkflow {
+        struct Scripted(HumanResponse);
+        impl HumanEscalation for Scripted {
+            fn escalate(
+                &self,
+                _e: Escalation,
+            ) -> Result<HumanResponse, wyrtloom_core::escalation::EscalationError> {
+                Ok(self.0.clone())
+            }
+        }
+        GatedWorkflow {
+            engine: GateEngine {
+                kanban: board,
+                escalation: Arc::new(Scripted(gate_response)),
+                audit: WorkflowAudit::new(Arc::new(NoopCallLogger)),
+            },
+            profile: WorkflowProfile::conversation_v01("human:owner".into()),
+            reader: "human:reader".into(),
+            reader_calibration: 0.0,
+        }
+    }
+
+    #[test]
+    fn ungated_pipeline_completes_as_before() {
+        let board = Arc::new(SqliteKanbanBoard::in_memory().unwrap());
+        let p = pipeline(board.clone(), None);
+        match p.run("demo", "2+2?") {
+            PipelineOutcome::Done { task_id, result } => {
+                assert_eq!(result, "4");
+                let task = board.get(task_id).unwrap();
+                assert_eq!(task.state, TaskState::Done);
+            }
+            other => panic!("expected Done, got {:?}", outcome_name(&other)),
+        }
+    }
+
+    #[test]
+    fn gated_pipeline_passes_both_gates_to_done() {
+        let board = Arc::new(SqliteKanbanBoard::in_memory().unwrap());
+        let g = gating(board.clone(), HumanResponse::Chose("approve".into()));
+        let p = pipeline(board.clone(), Some(g));
+
+        match p.run("demo", "2+2?") {
+            PipelineOutcome::Done { task_id, .. } => {
+                let task = board.get(task_id).unwrap();
+                assert_eq!(task.state, TaskState::Done);
+                // The board history shows both gate approvals, stamped by
+                // the human reader, not the agent.
+                let reasons: Vec<String> = task
+                    .history
+                    .iter()
+                    .filter_map(|h| h.reason.clone())
+                    .collect();
+                assert!(reasons.iter().any(|r| r.contains("gate 'design-review' approved")));
+                assert!(reasons.iter().any(|r| r.contains("gate 'ship-review' approved")));
+                let gate_actors: Vec<&str> = task
+                    .history
+                    .iter()
+                    .filter(|h| h.reason.as_deref().map_or(false, |r| r.contains("gate")))
+                    .map(|h| h.actor.as_str())
+                    .collect();
+                assert!(gate_actors.iter().all(|a| *a == "human:reader"));
+            }
+            other => panic!("expected Done, got {:?}", outcome_name(&other)),
+        }
+    }
+
+    #[test]
+    fn gated_pipeline_holds_at_the_design_gate() {
+        let board = Arc::new(SqliteKanbanBoard::in_memory().unwrap());
+        let g = gating(board.clone(), HumanResponse::Chose("hold".into()));
+        let p = pipeline(board.clone(), Some(g));
+
+        match p.run("demo", "2+2?") {
+            PipelineOutcome::Blocked { task_id, reason } => {
+                assert!(reason.contains("held at gate"));
+                // The gate never opened: the task did not reach Running.
+                let task = board.get(task_id).unwrap();
+                assert_ne!(task.state, TaskState::Running);
+                assert_ne!(task.state, TaskState::Done);
+            }
+            other => panic!("expected Blocked, got {:?}", outcome_name(&other)),
+        }
+    }
+
+    #[test]
+    fn gated_pipeline_stops_when_the_human_stops_the_gate() {
+        let board = Arc::new(SqliteKanbanBoard::in_memory().unwrap());
+        let g = gating(board.clone(), HumanResponse::Stop);
+        let p = pipeline(board.clone(), Some(g));
+        assert!(matches!(p.run("demo", "2+2?"), PipelineOutcome::Stopped { .. }));
+    }
+
+    fn outcome_name(o: &PipelineOutcome) -> &'static str {
+        match o {
+            PipelineOutcome::Done { .. } => "Done",
+            PipelineOutcome::Stopped { .. } => "Stopped",
+            PipelineOutcome::Blocked { .. } => "Blocked",
+        }
     }
 }

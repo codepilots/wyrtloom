@@ -35,6 +35,7 @@ pub enum GovernanceError {
     PrivateLedger,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CalibrationLedger {
     owner: ActorId,
     governance: LedgerGovernance,

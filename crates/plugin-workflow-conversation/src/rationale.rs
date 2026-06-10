@@ -37,7 +37,7 @@ impl AdrRecord {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct RationaleLedger {
     records: Vec<AdrRecord>,
 }

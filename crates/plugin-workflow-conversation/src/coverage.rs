@@ -48,7 +48,7 @@ pub struct TeamView {
     pub per_concept_redundancy: BTreeMap<ConceptId, usize>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct CoverageMap {
     concepts: BTreeMap<ConceptId, Concept>,
     links: BTreeMap<ConceptId, Vec<ArtifactRef>>,
