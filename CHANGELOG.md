@@ -2,6 +2,60 @@
 
 ---
 
+## Comprehension-first workflow plugin (2026-06-10)
+
+Implements the specification addendum "The Conversation" (SoftDevSpec.md)
+as a new plugin-layer crate, `plugin-workflow-conversation`. Zero new core
+components: every mechanism composes the locked core contracts (kanban,
+escalation, logger, sandbox, agent messages). All gating, grading,
+crediting, scheduling, and routing logic is coded and deterministic — no
+LLM output decides anything (CG-4).
+
+Component inventory (W1–W13, §2.2), one module each:
+
+- **W1 Workflow profile** (`workflow.rs`) — stages as Kanban columns, gate
+  placement, per-stage task profiles, practice feature flags (§2.7).
+- **W2 Gate engine** (`gate.rs`) — guarded transitions; digest-before-
+  challenge ordering (CG-1); approval tokens carrying the blame-allocation
+  notice (CG-24).
+- **W3 Digest generator** (`digest.rs`) — instruction-first lessons with
+  the seductive-details guard (CG-2) and calibration-based fading (CG-3).
+- **W4 Hunt harness** (`hunt.rs`) — sandboxed human-authored breaking
+  tests (CG-5); trace ∩ map crediting regardless of outcome (CG-6); defect
+  → crystallisation lifecycle (CG-7); bounded stake escalation (CG-8); no
+  gamification fields anywhere (CG-9).
+- **W5 Probe ladder** (`probe.rs`) — execution-graded prediction probes,
+  scaffolds that never count toward mastery, staircase difficulty (CG-18);
+  dark-territory-only triggering per policy mode (CG-19); design-defect
+  signal on wrong-prediction-plus-anomaly (CG-20).
+- **W6 Coverage map** (`coverage.rs`) — concepts ↔ artifacts ↔ humans;
+  aggregate-only team views with no actor identifiers (CG-21).
+- **W7 Calibration ledger** (`calibration.rs`) — private-by-default,
+  retention-limited, owner export/delete, enforced at the storage layer
+  (CG-21/22); declared developmental purpose with no appraisal or ranking
+  API (CG-23).
+- **W8 Mastery policy** (`policy.rs`) — §2.4 schema;
+  `aggregate_only_team_views` locked true at the type level; redundant
+  assignment rejected as Phase 2; owner changes gated (D11).
+- **W9 Insight Artifacts** (`insight.rs`) — §2.5 schema; human-authored,
+  agent-captured, linkable, supersedable (CG-27).
+- **W10 Interest router** (`interest.rs`) — deterministic signals (CG-25),
+  flow-channel routing, decline-without-record (CG-26).
+- **W11 Withdrawal scheduler** (`withdrawal.rs`) — expanding-interval solo
+  flights (CG-13); agent-absence enforcement with logged, never-penalised
+  abort (CG-14); outcomes as practice events (CG-15).
+- **W12 Rotation scheduler** (`rotation.rs`) — deterministic role rotation
+  over the typed agent-message contracts (CG-16); human-only criticality
+  overrides (CG-17).
+- **W13 Rationale ledger** (`rationale.rs`) — ADR-shaped records.
+
+Build & Own quota selection (CG-10..12) lives in `build_own.rs`; CG-28
+audit events mirror onto the call-logger contract in `audit.rs`. `main.rs`
+registers the plugin (Safe class, no capabilities) and demos a gated
+passage. Test count grew from 103 to 174; all pass.
+
+---
+
 ## Code-review fixes (2026-06-07)
 
 Ten findings from an internal code review addressed.

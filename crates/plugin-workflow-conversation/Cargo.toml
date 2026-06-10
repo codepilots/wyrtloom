@@ -1,0 +1,13 @@
+[package]
+name = "plugin-workflow-conversation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+wyrtloom-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+thiserror.workspace = true

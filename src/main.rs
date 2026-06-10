@@ -82,6 +82,19 @@ fn main() -> anyhow::Result<()> {
         },
         || Arc::new(()),
     );
+    // Comprehension-first workflow (SoftDevSpec.md addendum): a pure
+    // plugin-layer construct that composes the locked core contracts —
+    // it implements no core contract of its own and needs no capability.
+    bootstrapper.register_plugin(
+        PluginManifest {
+            name: "plugin-workflow-conversation".into(),
+            version: SemVer::new(0, 1, 0),
+            class: PluginClass::Safe,
+            capabilities: vec![],
+            implements: vec![],
+        },
+        || Arc::new(()),
+    );
 
     let sys = bootstrapper.run().map_err(|e| anyhow::anyhow!("{}", e))?;
     println!("[boot] Security + all plugins verified ✓");
@@ -162,6 +175,52 @@ fn main() -> anyhow::Result<()> {
     }
 
     println!("\n[logger] SQLite call logger recording every LLM call with tokens + cost.");
+
+    // ── Demo: comprehension-first workflow gate (SoftDevSpec addendum) ────────
+    println!("\n--- Comprehension workflow demo ---");
+    {
+        use plugin_escalation_cli::ScriptedEscalation;
+        use plugin_workflow_conversation::audit::WorkflowAudit;
+        use plugin_workflow_conversation::coverage::Concept;
+        use plugin_workflow_conversation::gate::{GateEngine, GateOutcome};
+        use plugin_workflow_conversation::workflow::WorkflowProfile;
+        use wyrtloom_core::kanban::{KanbanBoard, NewTask, TaskState};
+
+        let mut profile = WorkflowProfile::conversation_v01("human:cli".into());
+        profile.gates[0].concepts_in_play.push(Concept {
+            id: "arithmetic-contract".into(),
+            component: "pipeline".into(),
+            summary: "the demo task's input/output contract".into(),
+        });
+        profile.validate().map_err(|e| anyhow::anyhow!("{}", e))?;
+        println!("[workflow] Profile '{}' validated: {} stages, {} gates", profile.id,
+                 profile.stages.len(), profile.gates.len());
+
+        let task_id = kanban.create(NewTask {
+            title: "gated-demo".into(),
+            actor: "agent:wyrtloom-v01".into(),
+            depends_on: vec![],
+        })?;
+        kanban.transition(task_id, TaskState::Todo, "agent:wyrtloom-v01".into(), None)?;
+        kanban.transition(task_id, TaskState::Ready, "agent:wyrtloom-v01".into(), None)?;
+
+        let engine = GateEngine {
+            kanban: kanban.clone(),
+            escalation: Arc::new(ScriptedEscalation::chose("approve")),
+            audit: WorkflowAudit::new(logger.clone()),
+        };
+        // A reader with no calibration history (score 0.0) gets the rich
+        // digest form — the lesson always precedes the challenge.
+        match engine.request_passage(task_id, &profile.gates[0], &"human:cli".into(), 0.0, &[], false) {
+            Ok(GateOutcome::Approved { token, digest }) => {
+                println!("[workflow] Gate '{}' approved; digest was {:?}", token.gate, digest.richness);
+                println!("[workflow] Token {} carries the blame-allocation notice ✓", token.id);
+            }
+            Ok(other) => println!("[workflow] Gate not passed: {:?}", other),
+            Err(e) => println!("[workflow] Gate error: {}", e),
+        }
+    }
+
     println!("\n🌿 Wyrtloom v0.1 boot complete.");
     Ok(())
 }
