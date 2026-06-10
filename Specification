@@ -1,0 +1,612 @@
+# 🌿 Wyrtloom
+
+### A Specification — Vision & Technical Build Document
+
+*Version 0.1 (Draft) · Licence: Apache 2.0 · Status: Pre-implementation*
+
+---
+
+> **wyrt** *(Old English)* — plant, herb, root; the living thing that grows from the ground.
+> **loom** *(Old English `geloma`)* — a tool; to weave; to emerge slowly into view from the dark.
+>
+> **Wyrtloom** — *a tool woven from roots, that emerges into action.*
+
+---
+
+## How to read this document
+
+This is **two documents bound as one**, sharing a single source of truth.
+
+- **Part I — The Vision** is human-readable. It tells the story: why Wyrtloom exists, what problem it solves, and the shape of its architecture. Read this if you want to understand *why*.
+- **Part II — The Technical Specification** is the build target, written to be consumed by an implementing engineer or LLM. It is precise, test-first, and scoped strictly to **v0.1**. Read this if you want to understand *how*.
+- **The Appendices** hold the complete detail: every interface contract, the full requirements register, the phased roadmap ("the car park"), security models, and the research that grounds each decision.
+
+The Vision describes the whole forest. The Technical Specification plants the first seed.
+
+---
+---
+
+# Part I — The Vision
+
+## 1. The problem
+
+By mid-2026, autonomous AI agents have stopped being a curiosity and become infrastructure. Tools like OpenClaw demonstrated that an agent connected to your apps and given the ability to *act* — not just talk — changes how work gets done. OpenClaw surpassed 100,000 GitHub stars within weeks of taking its name, and the agentic-workflow pattern now generates more than half of all output tokens on some major model-routing platforms.
+
+But this first generation revealed three deep problems.
+
+**They burn tokens recklessly.** Multi-agent systems routinely consume four to fifteen times more tokens than a single well-formed call when they are not carefully optimised. Every redundant thought, every re-sent context window, every chatty handoff between agents costs money and, less visibly, energy. The current approach treats the language model as a hammer for every nail. This is wasteful in a way that compounds: at planetary scale, careless agent design is an environmental cost, not just a financial one.
+
+**They are monolithic.** The dominant frameworks bundle everything together. When teams outgrow the framework's assumptions, they hit a wall. One production team, after a year of fighting their framework's abstractions, removed it entirely and reported that "once we removed it, we could just code." A framework should be a trellis that supports growth, not a cage that constrains it.
+
+**They are unsafe by accident.** Agents granted broad system access, exposed to untrusted content, and able to communicate externally form what Simon Willison named the "lethal trifecta" — the precise conditions for prompt-injection and data-exfiltration attacks. Security in most agent platforms is an afterthought bolted on, not a foundation built in.
+
+Wyrtloom is a response to all three.
+
+## 2. The philosophy
+
+Wyrtloom is built on a single guiding belief: **the language model is the most expensive consultant in the building, so you only call it when no cheaper mechanism will do.**
+
+Everything follows from this. Before a token is ever spent, the system does as much deterministic, coded work as possible. A small, cheap model parses intent. A tool engine does the heavy lifting. The expensive frontier model is engaged only at the genuine decision points — and when it is, the prompt is designed to extract as much useful output from a single turn as the model's output budget allows.
+
+This is not only thrift. It is a green principle. Saving tokens saves energy. A system that gets *more efficient over time* — that learns to need its expensive consultant less and less — is a system that treads more lightly on the world. That is the heart of Wyrtloom.
+
+Three further principles shape everything:
+
+**Minimal core, everything else a plugin.** The core is the smallest possible kernel that can bootstrap the system and guarantee a stable, portable ecosystem. It must be small enough that two or three people could maintain it indefinitely. Every capability — providers, memory, UIs, the machine-learning tuner, even the sandbox runtime — is a plugin behind a stable interface.
+
+**Interfaces are sacred; implementations are free.** The lesson of every fragmented ecosystem is that breaking an interface cascades failures across everything built on it. Wyrtloom commits to stable, versioned interface contracts from day one. The shape of a message, a capability declaration, a task handoff — these are public promises. What sits behind them can be swapped freely.
+
+**Security is a first-class citizen, present before anything else breathes.** Security is not a plugin you add. It is the root of trust that initialises first, verifies the loader, and stamps every message that crosses the system. It learns malicious patterns over time and shares what it learns, like a forest's mycelial network alerting its neighbours to a pathogen.
+
+## 3. The metaphor
+
+A forest floor is not chaos. Beneath it runs the mycelium — a vast fungal network that connects the trees, channels nutrients to where they are needed, and acts as an immune membrane, detecting and destroying pathogens. When one tree is attacked, the network warns the others, and they arm their defences before the threat arrives.
+
+Wyrtloom is built in this image. Agents are woven together from a minimal rooted core. Work and nutrients (context, tokens) flow only where needed. The security layer is the immune membrane. Threat intelligence propagates between installations faster than attacks can spread. And the whole system is designed to grow richer and more efficient the longer it lives — composting its own experience into reusable code, the way a forest builds soil.
+
+## 4. How Wyrtloom works (a tour)
+
+A **human** gives Wyrtloom a task — through a chat interface, a CLI, or eventually a messaging channel like Discord. Each human has a profile, so their interactions are clearly attributed.
+
+The task lands on a **Kanban board**, the single source of truth for what needs doing, who is doing it, and what is stuck. This idea is borrowed directly from Hermes Agent, whose durable Kanban board turns multi-agent collaboration into a first-class primitive. Tasks move through clear states — backlog, todo, ready, running, blocked, done, archived — and the board, not chatter between agents, is how everyone knows the state of the world. This dramatically reduces the wasteful back-and-forth that plagues multi-agent systems.
+
+Before any expensive work begins, a **pre-digestion pipeline** runs: parse the intent cheaply, plan deterministically, do as much with coded tools as possible, and only *then* hand a tightly-scoped problem to a language model. Each task carries a **task profile** that shapes its environment — which tools it can see, how much context it receives, and how readily it should ask for help rather than flailing. A narrow, well-scoped agent is both cheaper and more reliable than one given everything and told to figure it out.
+
+When a model *is* called, every detail is **logged** — provider, model, tokens in, tokens out, cost, outcome. This log is the raw material for the future machine-learning tuner that will, over time, learn which model is worth its price for which kind of task, and how to shape prompts for maximum single-turn yield.
+
+Agents work in isolation where their work might collide — each on its own Git branch, with artifact-level locking so two agents never fight over the same file. An **orchestrator** watches for stalls and tries gently to revive a stuck agent before escalating to a human. When a human *is* needed, the board shows it clearly, with suggested actions as buttons, a free-text box, and a stop button.
+
+Everything an agent can do is mediated by the **security layer**. Plugins come in two classes: *safe* plugins run fully sandboxed in WebAssembly and can be shared and installed automatically; *unsafe* plugins, which need real system access, declare their required capabilities upfront like an app requesting permissions, and a human must approve them. Every message crossing the system earns a security "stamp"; if it is transformed, the stamp is void and must be re-earned. Dangerous actions — a shell command, a file deletion — are rated for their potential side effects, and routed accordingly: passed, logged, escalated, or blocked.
+
+Over time, Wyrtloom is designed to **improve itself**. It reviews its own logs for patterns that recur often enough to be worth turning into deterministic code — "crystallising" expensive LLM habits into cheap functions. Trusted installations share threat intelligence and safe plugins, forming a commons that grows more capable and more secure together.
+
+## 5. What Wyrtloom is not
+
+It is not a monolith. It is not a framework that dictates how you must think. It is not a system that treats the language model as the answer to everything. It is not secure-by-afterthought. And it is not finished — it is a seed, designed to grow along a deliberate path.
+
+---
+---
+
+# Part II — Technical Specification (v0.1)
+
+## 6. Scope and intent
+
+This specification defines **Wyrtloom v0.1 — "The Seed."** Its single goal is to prove the core architecture end-to-end:
+
+> *Can an agent receive a task, log it on the Kanban board, call an LLM using a task profile, and either complete the task or cleanly escalate it to a human — with every interface defined by a contract test, and every byte of the language model's cost accounted for?*
+
+Anything beyond this goal is **out of scope for v0.1** and is recorded in the roadmap (Appendix E, "The Car Park"). Implementers must resist the temptation to build parked features early; the value of v0.1 is in proving the *spine*, not the limbs.
+
+### 6.1 In scope for v0.1
+
+- The Rust **core kernel**: security module, plugin loader, sandbox interface + runtime, message-bus primitive, Kanban state machine, and the interface contracts for LLM provider, call logger, human escalation, and agent messages.
+- A working **bootstrap sequence** in the defined order.
+- One **LLM provider plugin** (Anthropic or Ollama — see §10.3).
+- One **Kanban storage plugin** (SQLite).
+- One **hard-coded task profile**.
+- One **WASM sandbox runtime** (wasmtime), core-controlled.
+- **CLI-based** human escalation (no graphical UI yet).
+- **Test-first development** throughout: a contract test for every core interface, written before its implementation.
+
+### 6.2 Explicitly out of scope for v0.1
+
+Multi-user profiles; project/artifact locking; Git integration; the orchestrator and stall recovery; the plugin marketplace; cryptographic plugin signing; the contract manager and cross-instance handoffs; the ML tuner; the memory provider; the full security policy engine; threat-intelligence sharing; the graphical Kanban UI. All are specified at a high level in the appendices and scheduled in Appendix E.
+
+## 7. Architectural overview
+
+Wyrtloom's core is two things and nothing more: a **bootstrap kernel** (the minimum needed to start the system) and a set of **stable interface contracts** (the promises that keep the plugin ecosystem portable). Every implementation lives behind a contract as a plugin.
+
+```
+┌───────────────────────────────────────────────────────────┐
+│                      WYRTLOOM CORE                          │
+│  (Rust — minimal, ~2-3 person maintainable, Apache 2.0)     │
+│                                                             │
+│   1. Security & Trust Module      ← root of trust           │
+│   2. Plugin Loader                ← bootstraps everything   │
+│   3. Sandbox Interface (+runtime) ← security boundary       │
+│   4. Message Bus Primitive        ← bootstrap signal        │
+│   5. Kanban State Machine         ← ecosystem stability     │
+│   6. LLM Provider Interface       ← contract only           │
+│   7. Call Logger Interface        ← contract only           │
+│   8. Human Escalation Interface   ← contract only           │
+│   9. Agent Message Contracts      ← typed comms schema      │
+└───────────────────────────────────────────────────────────┘
+        ▲                ▲               ▲              ▲
+        │                │               │              │
+   ┌────┴───┐      ┌─────┴────┐    ┌─────┴────┐   ┌─────┴─────┐
+   │ SQLite │      │ Anthropic│    │ wasmtime │   │   CLI     │
+   │ Kanban │      │ provider │    │ sandbox  │   │ escalation│
+   │ plugin │      │ plugin   │    │ runtime  │   │  plugin   │
+   └────────┘      └──────────┘    └──────────┘   └───────────┘
+   (all plugins behind core interface contracts)
+```
+
+### 7.1 The two design lenses
+
+Every candidate for the core was tested against two questions. These lenses are themselves part of the specification — they must be applied to any future proposal to expand the core.
+
+1. **The Bootstrap Lens.** *Can this exist before the plugin loader runs?* If something must already be running for this component to load, the component (or its minimal seed) belongs in core. The message bus is the classic case: you cannot load a message-bus *plugin* without something already able to receive the "loaded" signal, so a minimal primitive must be core.
+
+2. **The Ecosystem Lens.** *If this interface varied between installations, would plugins stop being portable?* If yes, the **interface contract** must live in core and be versioned carefully — even though the **implementation** is a swappable plugin. This is how USB standardises the connector but not the device, and how POSIX standardises the filesystem interface but not the filesystem.
+
+A useful corollary, learned the hard way by other projects: **if an interface is hard to test, it is probably the wrong shape.** Difficulty writing a clean contract test is a design signal, not merely an inconvenience.
+
+## 8. The bootstrap sequence
+
+The core initialises in a strict, defined order. Security comes first and verifies each subsequent stage. Untrusted code never loads until the gate is standing.
+
+```
+1.  Security & Trust Module initialises (root of trust)
+2.  Plugin Loader initialises          (verified by security)
+3.  Sandbox Runtime loads              (core-controlled; verified)
+4.  Message Bus Primitive starts
+5.  Kanban State Machine starts
+6.  LLM Provider Interface registers
+7.  Call Logger + Human Escalation interfaces register
+8.  Agent Message Contracts register
+9.  Trusted plugins load (in capability order)
+10. SAFE / sandboxed plugins load (inside the sandbox)
+```
+
+A failure at any stage halts bootstrap with a logged, human-readable reason. The system never proceeds in a partially-secured state.
+
+## 9. Test-first development (mandatory)
+
+Wyrtloom is developed test-first, without exception. The discipline is not decorative; in early development **the contract test suite *is* the specification.** Each core interface is defined by its tests before any implementation exists.
+
+The required cycle for every interface and component:
+
+1. Write the **contract test** that describes the interface's observable behaviour — its inputs, outputs, error modes, and invariants.
+2. Confirm the test **fails** (no implementation yet).
+3. Write the **minimum implementation** to pass.
+4. Refactor, keeping tests green.
+5. If the test was **awkward to write**, treat that as evidence the interface is mis-shaped, and redesign before proceeding.
+
+Interface tests carry a second duty: they validate the *balance* every interface must strike — exposing enough to be useful (efficiency) without locking down what may need to change (flexibility). An interface that exposes too much is as much a defect as one that exposes too little.
+
+Versioning is in force from the first commit. The core and all default plugins follow **semantic versioning**. Backward compatibility is treated as sacred: no breaking change to a published interface without a major-version bump and a documented deprecation path. Optional parameters may be added; required ones may never be removed.
+
+## 10. Core component specifications (v0.1)
+
+Each component below lists its responsibility, what is in core versus plugin, and the headline behaviours its contract test must verify. Full interface signatures are in **Appendix A**.
+
+### 10.1 Security & Trust Module
+
+**Responsibility.** The root of trust. Initialises first; verifies the integrity of the plugin loader and sandbox runtime before they run; enforces capability grants; maintains the audit log of all security decisions; issues and invalidates message "stamps."
+
+**Core vs plugin.** The module itself is **core and cannot be a plugin** — it is the thing that verifies plugins. In v0.1 it implements the minimal viable gate; the richer policy engine, danger-rating, anomaly detection, and threat sharing are parked (Appendix E, Phase 3) but their interface seams are reserved now so they can be added without breaking the core.
+
+**v0.1 behaviours (contract-tested).**
+- Initialises before any other component; refuses to proceed if its own integrity check fails.
+- Verifies a plugin's declared capabilities against an allow-list before the loader instantiates it.
+- A SAFE-class plugin requesting any system capability is **rejected** (a safe plugin that needs system access is a contradiction).
+- Every security decision (grant, denial, stamp issue, stamp invalidation) is written to the audit log with a timestamp and reason.
+- The **single security gate** is applied once per *form* of a message. If a message is transformed, its prior stamp is invalidated and it must pass the gate again. (v0.1 has no translation, so in practice the gate runs once — but the invalidation-on-transform rule is implemented and tested now.)
+
+### 10.2 Plugin Loader
+
+**Responsibility.** Discovers, verifies (via the security module), and instantiates plugins. Reads each plugin's manifest, including its class (SAFE/UNSAFE) and declared capabilities.
+
+**Core vs plugin.** Core and non-negotiable — it is the bootstrap mechanism that loads everything else.
+
+**v0.1 behaviours (contract-tested).**
+- Parses a plugin **manifest** declaring: name, semantic version, class (SAFE/UNSAFE), declared capabilities, and the interface contract(s) it implements with their versions.
+- Refuses to load a plugin whose manifest fails schema validation.
+- Refuses to load a plugin whose declared interface version is incompatible with the core's contract version.
+- Submits every plugin to the security module before instantiation; honours rejection.
+- Loads plugins in the defined bootstrap order.
+
+### 10.3 LLM Provider Interface
+
+**Responsibility.** A stable contract for calling a language model: send messages, receive a response, and receive the token counts and cost associated with the call.
+
+**Core vs plugin.** The **interface contract and the cost-model schema** live in core (so the future ML tuner can read costs uniformly regardless of provider). Every **provider implementation is a plugin.** v0.1 ships exactly one.
+
+> **Decision required (carried forward):** the single v0.1 provider should be **Ollama** if the priority is local, zero-cost, offline development and the green/efficiency ethos; or **Anthropic** if the priority is exercising a real cloud cost-model and output-token-limit behaviour. Recommendation: **Ollama for the default test/dev provider** (free, local, fast iteration, no API keys in CI), with the Anthropic plugin as the first Phase-2 addition to validate real cost tracking. The interface must be designed so this choice is invisible to the rest of the system.
+
+**v0.1 behaviours (contract-tested).**
+- Accepts a request of typed messages plus a generation budget (max output tokens), and returns a response plus a usage record (input tokens, output tokens, and — where the provider supplies pricing — cost).
+- The usage record conforms to the core **cost-model schema** even when cost is unknown (cost may be null; tokens may not).
+- Surfaces provider errors through the contract's typed error variants, never as opaque panics.
+- Respects the supplied output-token budget.
+
+### 10.4 Kanban State Machine
+
+**Responsibility.** The single source of truth for task state. Defines the legal states, the legal transitions between them, and the locking semantics that prevent conflicting work.
+
+**Core vs plugin.** The **state machine contract** (states + transitions + locking rules) is core, because the entire ecosystem depends on it being identical across installations. The **storage implementation** is a plugin; v0.1 ships SQLite.
+
+**States (v0.1):** `backlog → todo → ready → running → blocked → done → archived`, adapted from Hermes Agent's proven model.
+
+**v0.1 behaviours (contract-tested).**
+- Only legal transitions are permitted; an illegal transition is rejected with a typed error.
+- `todo → ready` promotion occurs only when a task's dependencies (if any) are all `done`. (v0.1 supports the dependency check even though multi-agent dependency *resolution* is parked.)
+- A task in `running` is claimed by exactly one worker; a second claim attempt fails atomically.
+- `blocked` requires a reason and a target (human or dependency).
+- Every state change is recorded with actor identity and timestamp (the audit trail that, in Phase 2, becomes the per-human attribution).
+
+### 10.5 Message Bus
+
+**Responsibility.** Carry messages between components without them depending directly on one another.
+
+**Core vs plugin.** A **minimal synchronous primitive** (a Rust channel) is in core to solve the bootstrap problem. The **interface contract** (the event shape) is in core for ecosystem portability. The **full implementation** is a plugin; v0.1's default is in-process Tokio channels. Richer buses (NATS, Redis) are parked.
+
+**v0.1 behaviours (contract-tested).**
+- A component can publish a typed event and a subscribed component receives it.
+- Event payloads conform to the registered event-shape contract.
+- The bootstrap primitive functions before any bus *plugin* is loaded.
+
+### 10.6 Sandbox Interface and Runtime
+
+**Responsibility.** Execute untrusted (SAFE-class) plugin code in isolation, following the WASM approach pioneered for agent sandboxing — a customised WebAssembly build (MicroPython / MicroQuickJS style) executed via a host runtime.
+
+**Core vs plugin.** The **sandbox interface contract** is core (it is a security boundary and cannot be delegated to untrusted code). The **runtime implementation** (wasmtime in v0.1) is a plugin, but it is **core-controlled**: loaded by the core itself before any untrusted plugin, and never replaceable by untrusted code.
+
+**v0.1 behaviours (contract-tested).**
+- A SAFE plugin executes within the sandbox and cannot access the filesystem, network, or host process.
+- Resource limits (memory, execution time) are enforced; a runaway sandboxed plugin is terminated.
+- An attempt by sandboxed code to reach a host capability fails closed and is logged by the security module.
+
+### 10.7 Call Logger Interface
+
+**Responsibility.** Record every LLM interaction for audit and for the future ML tuner.
+
+**Core vs plugin.** **Interface in core** (so all callers log uniformly); implementation is a plugin.
+
+**v0.1 behaviours (contract-tested).**
+- Every LLM call produces a log entry containing provider, model, input tokens, output tokens, cost (nullable), task id, profile, timestamp, and outcome.
+- A failed or partial call is logged with its error, not dropped.
+
+### 10.8 Human Escalation Interface
+
+**Responsibility.** Route a decision to a human when an agent cannot or should not proceed alone.
+
+**Core vs plugin.** **Interface in core**; v0.1 implementation is CLI. The interface is shaped now to support the eventual universal pattern — a set of suggested action **options**, a **free-text** channel, and a **stop** control — so the graphical implementation in Phase 2 needs no interface change.
+
+**v0.1 behaviours (contract-tested).**
+- An escalation presents a prompt, a list of suggested options, and always offers free-text and stop.
+- The human's response is returned to the waiting task through the contract; a stop cleanly halts the task.
+- The escalation event and its resolution are recorded on the Kanban board.
+
+### 10.9 Agent Message Contracts
+
+**Responsibility.** Define the typed vocabulary agents use to communicate, so that communication is structured rather than free-form chat — the foundation for avoiding wasteful handoff loops.
+
+**Core vs plugin.** The **typed message schema** is core. v0.1 defines the types and validates them; full multi-agent routing, hop limits, and cycle detection are parked (Phase 2) but the message types are designed now to carry the fields those features will need (e.g. a hop counter, an originating task id).
+
+**v0.1 behaviours (contract-tested).**
+- Messages are one of the defined types (`request`, `response`, `delegation`, `result`, `error`); an untyped or malformed message is rejected.
+- Each message carries an originating task id and a hop counter (unused for routing in v0.1, but present and validated).
+
+## 11. Token-efficiency requirements (cross-cutting)
+
+Token efficiency is not a feature; it is a constraint that touches every component. Even in v0.1, the following are required:
+
+- **Pre-digestion before LLM.** The task pipeline must do deterministic work first and call the model only at genuine decision points. v0.1 implements the pipeline shape (`parse → plan → execute → verify`) even with a single agent.
+- **Profile-scoped context.** The hard-coded task profile must constrain the context passed to the model to what the role needs — minimising tool exposure and irrelevant history.
+- **Output-budget awareness.** The provider interface carries an output-token budget; prompts should be designed to maximise useful single-turn yield within it. The budget should ultimately be user-configurable (parked), but the plumbing exists in v0.1.
+- **Full cost accounting.** Because every call is logged with tokens and cost, efficiency is measurable from day one — the precondition for the later ML tuner.
+
+## 12. Definition of done for v0.1
+
+v0.1 is complete when, with all contract tests green:
+
+1. The system boots through the full defined sequence, security first.
+2. A task can be created on the Kanban board via the CLI and attributed to an actor.
+3. The task runs through the `parse → plan → execute → verify` pipeline under a hard-coded profile.
+4. At a decision point, the single LLM provider is called within an output budget, and the call is fully logged (tokens + cost).
+5. The task either reaches `done`, or reaches `blocked` and escalates cleanly to the human via the CLI, who can choose an option, type free text, or stop.
+6. A SAFE plugin runs sandboxed and is demonstrably unable to touch the host.
+7. Every core interface has a contract test that was written before its implementation.
+
+---
+---
+
+# Appendices
+
+## Appendix A — Core interface contracts (v0.1)
+
+> These are specification-level signatures expressed in Rust-like pseudocode to fix the *shape* of each contract. Exact types are settled during the test-first cycle; what matters here is the surface each test must pin down. All fallible operations return `Result<T, TypedError>` — no panics across interface boundaries.
+
+### A.1 LLM Provider
+
+```rust
+/// The cost-model schema lives in core so all callers and the future
+/// ML tuner read usage uniformly, regardless of provider.
+struct Usage {
+    input_tokens:  u64,
+    output_tokens: u64,
+    cost:          Option<Money>,   // null when provider gives no pricing
+}
+
+struct GenerationRequest {
+    messages:        Vec<Message>,
+    max_output_tokens: u32,         // the output budget; must be respected
+    model:           ModelId,
+}
+
+struct GenerationResponse {
+    content: Vec<ContentBlock>,
+    usage:   Usage,
+}
+
+trait LlmProvider {              // implemented by plugins; one in v0.1
+    fn generate(&self, req: GenerationRequest)
+        -> Result<GenerationResponse, ProviderError>;
+    fn models(&self) -> Vec<ModelDescriptor>;   // includes cost-model where known
+}
+
+enum ProviderError { RateLimited, Unauthorized, BudgetExceeded,
+                     Transport(String), Provider(String) }
+```
+
+### A.2 Kanban State Machine
+
+```rust
+enum TaskState { Backlog, Todo, Ready, Running, Blocked, Done, Archived }
+
+struct Task {
+    id:           TaskId,
+    state:        TaskState,
+    actor:        Option<ActorId>,   // human or agent identity
+    depends_on:   Vec<TaskId>,
+    block_reason: Option<BlockReason>,
+    history:      Vec<StateChange>,  // append-only audit trail
+}
+
+struct StateChange { from: TaskState, to: TaskState,
+                     actor: ActorId, at: Timestamp, reason: Option<String> }
+
+trait KanbanBoard {              // contract in core; SQLite impl is the v0.1 plugin
+    fn create(&self, task: NewTask) -> Result<TaskId, KanbanError>;
+    fn transition(&self, id: TaskId, to: TaskState, actor: ActorId,
+                  reason: Option<String>) -> Result<(), KanbanError>;
+    fn claim(&self, id: TaskId, worker: ActorId) -> Result<(), KanbanError>; // atomic
+    fn get(&self, id: TaskId) -> Result<Task, KanbanError>;
+}
+
+enum KanbanError { IllegalTransition { from: TaskState, to: TaskState },
+                   DependenciesNotDone, AlreadyClaimed,
+                   BlockReasonRequired, NotFound }
+```
+
+### A.3 Plugin Manifest & Loader
+
+```rust
+enum PluginClass { Safe, Unsafe }
+
+enum Capability { FileRead(PathScope), FileWrite(PathScope),
+                  Network(HostScope), Shell, Git, /* extensible */ }
+
+struct PluginManifest {
+    name:          String,
+    version:       SemVer,
+    class:         PluginClass,
+    capabilities:  Vec<Capability>,        // must be empty for Safe plugins
+    implements:    Vec<(ContractId, SemVer)>,
+}
+
+trait PluginLoader {             // core, non-negotiable
+    fn discover(&self) -> Vec<PluginManifest>;
+    fn load(&self, m: &PluginManifest) -> Result<LoadedPlugin, LoadError>;
+    // load() MUST consult SecurityModule::verify before instantiation
+}
+
+enum LoadError { ManifestInvalid, IncompatibleContractVersion,
+                 SecurityRejected(String), SafePluginRequestedCapability }
+```
+
+### A.4 Security Module
+
+```rust
+trait SecurityModule {           // core; the root of trust; never a plugin
+    fn self_check(&self) -> Result<(), SecurityError>;        // runs first
+    fn verify(&self, m: &PluginManifest) -> Result<(), SecurityError>;
+    fn stamp(&self, msg: &Message) -> Stamp;                  // issue on a form
+    fn invalidate(&self, stamp: Stamp);                       // on transform
+    fn audit(&self, decision: SecurityDecision);              // append-only
+}
+
+enum SecurityError { IntegrityFailure, CapabilityDenied(Capability),
+                     SafePluginViolation }
+```
+
+### A.5 Sandbox
+
+```rust
+trait SandboxRuntime {           // contract in core; wasmtime impl is core-controlled plugin
+    fn execute(&self, code: SafeModule, input: Bytes, limits: ResourceLimits)
+        -> Result<Bytes, SandboxError>;
+}
+
+struct ResourceLimits { max_memory_bytes: u64, max_wallclock_ms: u64 }
+
+enum SandboxError { MemoryExceeded, Timeout,
+                    HostAccessAttempted(Capability), Trap(String) }
+```
+
+### A.6 Call Logger
+
+```rust
+struct CallLog {
+    task:    TaskId,    profile: ProfileId,
+    provider: String,   model:  ModelId,
+    usage:   Usage,     outcome: CallOutcome,    at: Timestamp,
+}
+enum CallOutcome { Completed, Failed(String), Partial(String) }
+
+trait CallLogger {               // interface in core; impl is a plugin
+    fn record(&self, entry: CallLog) -> Result<(), LogError>;
+}
+```
+
+### A.7 Human Escalation
+
+```rust
+struct Escalation {
+    task:    TaskId,
+    prompt:  String,
+    options: Vec<ActionOption>,   // suggested actions, shown as buttons in Phase 2 UI
+}                                 // free-text and stop are ALWAYS implicitly available
+
+enum HumanResponse { Chose(ActionOptionId), FreeText(String), Stop }
+
+trait HumanEscalation {          // interface in core; CLI impl in v0.1
+    fn escalate(&self, e: Escalation) -> Result<HumanResponse, EscalationError>;
+}
+```
+
+### A.8 Agent Messages
+
+```rust
+enum AgentMessage {
+    Request    { origin_task: TaskId, hops: u8, body: Bytes },
+    Response   { origin_task: TaskId, hops: u8, body: Bytes },
+    Delegation { origin_task: TaskId, hops: u8, body: Bytes },
+    Result     { origin_task: TaskId, hops: u8, body: Bytes },
+    Error      { origin_task: TaskId, hops: u8, error: String },
+}
+// hops present and validated in v0.1; hop-limit ENFORCEMENT is Phase 2.
+```
+
+### A.9 Message Bus
+
+```rust
+trait MessageBus {               // primitive + contract in core; Tokio impl is default plugin
+    fn publish(&self, topic: Topic, event: Event) -> Result<(), BusError>;
+    fn subscribe(&self, topic: Topic) -> Receiver<Event>;
+}
+```
+
+## Appendix B — Plugin model and security architecture (full)
+
+This appendix records the complete intended security and plugin architecture. Only the parts marked **(v0.1)** are built in the first milestone; the rest is reserved design that the v0.1 interfaces must not preclude.
+
+### B.1 Plugin classes
+
+- **SAFE plugins (v0.1 interface).** No system access. Run fully sandboxed in WebAssembly. Because they structurally cannot form the "lethal trifecta" (private data + untrusted content + external comms), they may be shared and installed automatically between trusted installations. A SAFE plugin that declares *any* system capability is rejected at load.
+- **UNSAFE plugins (v0.1 interface; human approval Phase 3).** Need real system access (file I/O, network, shell, git). Must declare required capabilities in their manifest, in the manner of mobile-app permissions. A human must approve capability grants; the community trust score modulates how much friction that approval carries.
+
+### B.2 The plugin marketplace and trust (Phase 3 — parked)
+
+- Agents may auto-publish SAFE plugins to a shared platform and auto-consume them.
+- **Three-layer trust:** a score attached to the *plugin*, the *agent* that produced it, and the *owner* behind that agent.
+- A low-trust plugin is subjected to a mandatory LLM **security scan** before integration; a high-trust plugin is streamlined but still sandboxed.
+- **Anti-abuse**, designed against the npm supply-chain lesson that trust without verification is exploited within days: cryptographic signing binds author identity to plugin; trust is time-weighted and cannot be farmed quickly (Sybil resistance); sudden trust spikes are flagged; the community can flag suspicious plugins; flagged plugins are quarantined pending review; inactive or flagged accounts suffer trust decay; and owner verification (KYC-lite) is required before an agent may publish.
+
+### B.3 The security gate and the passport stamp (full model; minimal in v0.1)
+
+A single security gate is applied to a message **once per form it takes**.
+
+- On entry, the message is checked (identity, signature/origin, and — in the full model — content danger) and, if it passes, **stamped**. The stamp asserts "this *form* of this message passed the gate."
+- If the message is later **transformed or translated**, the stamp is **invalidated**, exactly like a passport stamp voided when you cross a new border. The new form must earn a fresh stamp.
+- v0.1 has no translation layer, so the gate runs once in practice — but the **invalidation-on-transform rule is implemented and tested now**, so the contract is honoured when translation arrives.
+
+### B.4 Contract security specs and danger rating (Phase 3 — parked)
+
+Every contract definition will carry a **security spec**: field-level danger ratings (low / medium / high / critical), risk-typed fields (e.g. `shell_command`, `file_path`, `url`, `code`), and human-readable side-effect descriptions. Dangerous typed fields are rated by a small, cheap LLM before execution, and routed by policy:
+
+```
+low      → pass silently
+medium   → log
+high     → escalate to human
+critical → block + alert
+```
+
+### B.5 Behavioural anomaly detection and the immune system (Phase 3 — parked)
+
+The security module will track each plugin's behaviour against a baseline of its declared role. A plugin acting dangerously outside its role triggers a graduated response — **log → rate-limit → block → quarantine + report**. Confirmed malicious patterns are shareable, cryptographically signed, between trusted installations, which may subscribe to threat feeds. This is the mycelial immune membrane: installations learn from one another's encounters, so defences spread faster than attacks.
+
+### B.6 The security policy engine (Phase 3 — parked)
+
+The security module exposes its own plugin interface for **policy handlers**, so new security contexts can be handled without changing the core. Example: an agent present on a Discord channel grants different tool permissions to verified versus unverified users. Policy plugins are themselves SAFE-class and sandboxed, and cannot self-escalate. All policy decisions are logged by the core module.
+
+## Appendix C — Concurrency, Git, and the orchestrator (Phase 2 — parked)
+
+- **Locking.** One agent should not begin work that depends on artifacts another agent is changing. Locking is **artifact-level**, not merely project-level, so concurrency is permitted wherever separation of concerns allows. Observer (read-only) access for supervision is possible but must guard against the read-then-write race.
+- **Git by default.** Each agent works on its own clone/branch, giving conflict detection for free (via merge conflicts), full audit trail, and rollback.
+- **The orchestrator.** An orchestrating agent detects stalls and responds in graduated fashion: first a soft "prod" with a hint injected, up to a configurable hard limit of restarts (default 3), then escalation to a human. As much of this logic as possible is **coded, not LLM-driven**, to save tokens.
+- **Avoiding handoff loops.** Agents coordinate through the Kanban board (shared state) rather than chatting, which removes most messaging. Where they do message, communication is via typed contracts; a configurable hop limit (default 3) and cycle detection (the same task id appearing twice in a chain) prevent the wasteful back-and-forth that inflates multi-agent token costs.
+
+## Appendix D — ML tuner, memory, and self-improvement (Phase 4 — parked)
+
+- **The ML tuner** is a **lightweight classical model** by default (a bandit algorithm, gradient-boosted trees, or simple reinforcement learning), training **locally** on the call logs. It assists agent/model selection and prompt design for efficiency. It deliberately **sacrifices explainability** for low compute cost — decisions are logged for audit but not narrated. The tuner is itself exposed as a **swappable plugin interface**, so neural or cloud-offload trainers can replace it later. Its training signal is cost-efficiency: *was the more expensive model worth it for this task type?*
+- **Tool prediction** progresses through three stages over the system's life: coded rules first (free, deterministic), then LLM assistance for ambiguous cases, then a learned keyword/phrase model. Human override is always available.
+- **Code crystallisation.** A periodic inspector reviews session logs for LLM-call patterns that recur often enough to be re-implemented as deterministic code, and flags them for human-approved promotion to a plugin. This is how Wyrtloom composts experience into soil — needing its expensive consultant less over time.
+- **Distillation** of logs into a local model for cheaper inference is attractive but compute-constrained; it is scheduled for low-activity windows and deferred until resources allow.
+- **Memory** is a **pluggable provider** (e.g. Mem0, a vector DB, or simple SQLite full-text search), keeping the core minimal. Lifetime-context search runs at query time through this provider. Modern token-efficient memory algorithms retrieve in roughly 7,000 tokens what naive full-context approaches spend 26,000 on — a large, recurring saving.
+
+## Appendix E — The Car Park (phased roadmap)
+
+The complete requirements register, partitioned by milestone. v0.1 builds only the first block; everything else is parked here, designed-for but not built, so the seed stays small while the path stays clear.
+
+### v0.1 — "The Seed" (36 requirements)
+Minimal core; Rust; TDD; Kanban state-machine contract + SQLite; one LLM provider; one hard-coded profile; WASM sandbox (wasmtime); message-bus primitive + Tokio default; plugin loader + manifest; minimal security gate; call logger; CLI escalation; agent message types defined; bootstrap order; semantic versioning + backward-compat policy; token-efficiency plumbing; name Wyrtloom; Apache 2.0.
+
+### Phase 2 — Multi-user & collaboration
+Human profiles with per-user attribution; project- and artifact-level locking; concurrency via separation of concerns; Git-by-default with per-agent branches; full Kanban UI with the buttons + free-text + stop pattern; multiple boards per profile domain; the orchestrator with graduated restart; cheap-LLM intent parsing; agent hop limits, cycle detection, and board-as-shared-state messaging; a second (Anthropic) provider; per-model cost config; auto-pulled pricing; efficiency tracking; retry/fallback plugin.
+
+### Phase 3 — Marketplace, trust & deep security
+Plugin marketplace; three-layer trust; LLM security scan for low-trust plugins; cryptographic signing; anti-abuse (rate limiting, time-weighted trust, anomaly detection, flagging, quarantine, trust decay, KYC-lite); the security policy engine with policy-handler plugins; the passport-stamp two-phase validation; contract security specs with danger ratings; LLM danger rating; behavioural anomaly detection; shared threat intelligence and feed subscription.
+
+### Phase 4 — Self-improvement
+The ML tuner (lightweight, local, swappable, non-explainable); cost-efficiency training signal; three-stage tool prediction; code crystallisation; scheduled distillation; pluggable memory provider; lifetime-context search.
+
+### Phase 5 — Profiles & onboarding
+Full task-profile model (tool set + context shape + escalation threshold); human override everywhere; LLM-guided profile-setup chat on first config; the contract manager (registry + version negotiation); translation plugin interface; cross-instance agent handoffs.
+
+### Deferred indefinitely
+Local-model distillation while compute-constrained; a formal RFC/governance process (noted as needed before v1.0 or first external contributors).
+
+## Appendix F — Reference platforms and grounding research
+
+Wyrtloom's design is anchored in observed reality, not speculation. Key references and the lessons drawn from each:
+
+**OpenClaw** (TypeScript/Swift; MIT; Gateway + Agent + Skills + Memory). Demonstrated demand for self-hosted agents that *act*. Its noted weakness — session memory requiring manual setup — informs Wyrtloom's pluggable memory provider. *Source: https://www.kdnuggets.com/openclaw-explained-the-free-ai-agent-tool-going-viral-already-in-2026 ; https://en.wikipedia.org/wiki/OpenClaw*
+
+**Hermes Agent** (Nous Research). Source of the Kanban model — a SQLite-backed, durable board with states, dependencies, and a dispatcher that turns multi-agent work into a first-class primitive; skills use progressive disclosure to minimise tokens. *Source: https://hermes-agent.nousresearch.com/docs/user-guide/features/kanban ; https://magnus919.com/2026/05/the-hermes-kanban-a-complete-guide-to-multi-agent-task-orchestration/*
+
+**Simon Willison — sandboxing.** The `micropython-wasm` / MicroQuickJS approach (a customised WASM build run via wasmtime) is the model for SAFE-plugin sandboxing; his "lethal trifecta" framing (private data + untrusted content + external comms) shapes the SAFE/UNSAFE split. *Source: https://simonwillison.net/tags/sandboxing/ ; https://en.wikipedia.org/wiki/Simon_Willison*
+
+**Token-efficiency research.** Multi-agent systems consume 4–15× the tokens of single calls if unoptimised; sparsification (S²-MAD) and action-chaining (ELHPlan) achieve large reductions; the DEPO paper (AAAI 2026) frames dual efficiency across both per-step tokens and trajectory-level calls. These ground Wyrtloom's central thesis. *Source: https://www.obviousworks.ch/en/token-optimization-saves-up-to-80-percent-llm-costs/ ; https://arxiv.org/pdf/2512.08545 ; https://arxiv.org/pdf/2511.15392*
+
+**Plugin-architecture failure lessons.** LangChain's over-abstraction (a team's eventual "once we removed it, we could just code"); the cascade danger of breaking interface changes; the npm supply-chain blast radius; and maintainer-burnout collapse (Ingress-Nginx) collectively justify the thin-interface, sacred-versioning, crypto-signing, and small-maintainable-core principles. *Source: https://shashankguda.medium.com/challenges-criticisms-of-langchain-b26afcef94e7 ; https://medium.com/@nraman.n6/versioning-rollback-lifecycle-management-of-ai-agents-treating-intelligence-as-deployable-deac757e4dea ; https://thenewstack.io/open-source-inside-2025s-4-biggest-trends/ ; https://www.techtarget.com/searchapparchitecture/tip/Treat-open-source-software-as-critical-infrastructure*
+
+**Memory efficiency.** Token-efficient memory retrieval (~7k tokens/retrieval versus ~26k for full-context) justifies treating memory as a first-class, pluggable efficiency lever. *Source: https://mem0.ai/blog/state-of-ai-agent-memory-2026*
+
+## Appendix G — Glossary
+
+- **Core / kernel** — the minimal, non-replaceable heart of Wyrtloom: bootstrap mechanism plus stable interface contracts.
+- **Contract** — a versioned interface promise. Stable across installations so plugins remain portable.
+- **Plugin** — any swappable implementation behind a core contract. SAFE (sandboxed, no system access) or UNSAFE (declares capabilities, needs human approval).
+- **Capability** — a declared system permission an UNSAFE plugin requires (file, network, shell, git…).
+- **Task profile** — the environment shaping an agent's run: its tools, its context budget, and its escalation threshold.
+- **Pre-digestion pipeline** — `parse → plan → execute → verify`; deterministic work first, LLM only at decision points.
+- **Stamp** — a security assertion that a given *form* of a message passed the gate; voided on transformation.
+- **Code crystallisation** — promoting a recurring expensive LLM pattern into cheap deterministic code.
+- **The car park** — the phased roadmap of designed-but-not-yet-built requirements (Appendix E).
+- **The two lenses** — the Bootstrap Lens and the Ecosystem Lens, the tests for whether something belongs in core.
+
+---
+
+*🌿 Wyrtloom — woven from roots, emerging into action. This specification is a living document; the contract test suite is its ground truth. End of v0.1 specification.*
