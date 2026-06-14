@@ -242,7 +242,9 @@ impl SecurityModule {
             return false;
         }
         let expected = self.compute_mac(content);
-        stamp.0 == expected
+        // Constant-time compare: a short-circuiting `==` leaks, via response
+        // timing, how many leading bytes of a forged stamp are correct.
+        constant_time_eq(&stamp.0, &expected)
     }
 
     /// Invalidate a stamp when the message it covers is transformed.
@@ -265,11 +267,23 @@ impl SecurityModule {
         self.audit_log.lock().unwrap().clone()
     }
 
-    /// Verify the in-memory audit chain: each entry's `prev_hash` must equal the
-    /// keyed MAC of its predecessor's serialisation. Because the link is a MAC
-    /// (not a bare hash), an attacker without the key cannot rewrite the chain
-    /// and recompute valid links — detecting tampering that a plain hash-chain
-    /// would miss. Returns the index of the first broken link on failure.
+    /// Verify the audit chain: each entry's `prev_hash` must equal the keyed MAC
+    /// of its predecessor's serialisation.
+    ///
+    /// Threat model — be precise about what this does and does NOT give you:
+    /// * It detects in-place mutation or mid-chain deletion/reordering of entries.
+    /// * Because the link is a *keyed* MAC, the guarantee is meaningful only when
+    ///   the verifier holds the key and the *attacker does not* — i.e. when a
+    ///   persisted log (see `with_audit_file`) is checked later by a separate
+    ///   trusted process holding the durable key. For the in-process in-memory
+    ///   log, any actor that can mutate the log can also read the key, so the
+    ///   keying adds nothing over a plain hash chain there.
+    /// * It does NOT detect *suffix truncation* (dropping the most recent
+    ///   entries) — the shortened chain still verifies. Detecting that requires
+    ///   an external high-water mark (a signed entry count / chain-head),
+    ///   tracked as roadmap (external anchoring).
+    ///
+    /// Returns an error identifying the first broken link.
     pub fn verify_chain(&self) -> Result<(), SecurityError> {
         let log = self.audit_log.lock().unwrap();
         let mut expected_prev = String::new();
@@ -360,14 +374,24 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// Bound and de-fang free-text audit detail: cap length and drop control
-/// characters (incl. newlines/escapes) so a hostile username/path cannot inject
-/// forged-looking lines into the audit log.
+/// characters (incl. newlines/escapes) AND Unicode bidi/format codepoints (e.g.
+/// U+202E) so a hostile username/path can neither inject forged-looking lines
+/// nor visually spoof the log ("Trojan Source").
 fn sanitize_detail(s: &str) -> String {
     const MAX: usize = 512;
     s.chars()
-        .filter(|c| !c.is_control())
+        .filter(|c| !c.is_control() && !crate::util::is_bidi_or_format(*c))
         .take(MAX)
         .collect()
+}
+
+/// Constant-time equality for two 32-byte MACs (no early exit).
+fn constant_time_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    let mut diff = 0u8;
+    for i in 0..32 {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
 }
 
 // ---------------------------------------------------------------------------
