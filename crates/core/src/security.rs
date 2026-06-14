@@ -139,6 +139,18 @@ impl SecurityModule {
     pub fn with_policy(policy: SecurityPolicy) -> Self {
         let mut key = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut key);
+        Self::with_key(key, policy)
+    }
+
+    /// Construct with an operator-supplied, **persisted** 32-byte key.
+    ///
+    /// The random `with_policy`/`new` key is ephemeral — stamps and the audit
+    /// chain anchor cannot be re-verified after a restart, and long-lived
+    /// consumers (session signing, tamper-evident audit) need stability. Supply a
+    /// durable key (e.g. from a root-only key file) to keep stamps and
+    /// `verify_chain` valid across restarts. The key must not be all-zero
+    /// (`self_check` rejects that).
+    pub fn with_key(key: [u8; 32], policy: SecurityPolicy) -> Self {
         Self {
             audit_log: Arc::new(Mutex::new(Vec::new())),
             hmac_key: key,
@@ -239,12 +251,49 @@ impl SecurityModule {
         self.invalidated.lock().unwrap().insert(stamp);
     }
 
+    /// Record an access-control decision (grant/denial) made by a consumer such
+    /// as the dashboard API server, into the same tamper-evident audit chain.
+    /// `detail` is length-bounded and stripped of control characters to prevent
+    /// log injection; never pass secret/key/token material here.
+    pub fn record_decision(&self, granted: bool, detail: String) {
+        let kind = if granted { DecisionKind::Grant } else { DecisionKind::Denial };
+        self.audit(kind, sanitize_detail(&detail));
+    }
+
     /// Read-only snapshot of the in-memory audit log.
     pub fn audit_log_snapshot(&self) -> Vec<SecurityDecision> {
         self.audit_log.lock().unwrap().clone()
     }
 
+    /// Verify the in-memory audit chain: each entry's `prev_hash` must equal the
+    /// keyed MAC of its predecessor's serialisation. Because the link is a MAC
+    /// (not a bare hash), an attacker without the key cannot rewrite the chain
+    /// and recompute valid links — detecting tampering that a plain hash-chain
+    /// would miss. Returns the index of the first broken link on failure.
+    pub fn verify_chain(&self) -> Result<(), SecurityError> {
+        let log = self.audit_log.lock().unwrap();
+        let mut expected_prev = String::new();
+        for (i, entry) in log.iter().enumerate() {
+            if entry.prev_hash != expected_prev {
+                return Err(SecurityError::IntegrityFailure(format!(
+                    "audit chain broken at entry {i}"
+                )));
+            }
+            let serialized = serde_json::to_string(entry).unwrap_or_default();
+            expected_prev = self.chain_link(serialized.as_bytes());
+        }
+        Ok(())
+    }
+
     // ── Private helpers ─────────────────────────────────────────────────────
+
+    /// Keyed chain link: HMAC-SHA256 over a domain tag + the entry serialisation.
+    fn chain_link(&self, serialized: &[u8]) -> String {
+        let mut buf = Vec::with_capacity(serialized.len() + 16);
+        buf.extend_from_slice(b"wyrtloom-audit-chain-v1\0");
+        buf.extend_from_slice(serialized);
+        hex(&self.compute_mac(&buf))
+    }
 
     fn compute_mac(&self, content: &[u8]) -> [u8; 32] {
         let mut mac = HmacSha256::new_from_slice(&self.hmac_key)
@@ -284,7 +333,7 @@ impl SecurityModule {
                 kind, detail, at: Timestamp::now(), prev_hash: last.clone(),
             };
             serialized = serde_json::to_string(&entry).unwrap_or_default();
-            *last = sha256_hex(serialized.as_bytes());
+            *last = self.chain_link(serialized.as_bytes());
         } // last_hash lock released; I/O and log push happen outside.
 
         // Optionally persist to file before touching in-memory log.
@@ -310,11 +359,15 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-fn sha256_hex(data: &[u8]) -> String {
-    use sha2::Digest;
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(data);
-    hex(&hasher.finalize())
+/// Bound and de-fang free-text audit detail: cap length and drop control
+/// characters (incl. newlines/escapes) so a hostile username/path cannot inject
+/// forged-looking lines into the audit log.
+fn sanitize_detail(s: &str) -> String {
+    const MAX: usize = 512;
+    s.chars()
+        .filter(|c| !c.is_control())
+        .take(MAX)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -463,16 +516,51 @@ mod tests {
     }
 
     #[test]
-    fn audit_entries_form_a_hash_chain() {
+    fn audit_entries_form_a_keyed_chain_that_verifies() {
         let s = sec();
         s.verify(&safe_manifest()).unwrap();
         s.verify(&safe_manifest()).unwrap();
         let log = s.audit_log_snapshot();
         assert!(log.len() >= 2);
-        // Second entry's prev_hash must equal SHA-256 of first entry.
-        let first_json = serde_json::to_string(&log[0]).unwrap();
-        let expected_hash = sha256_hex(first_json.as_bytes());
-        assert_eq!(log[1].prev_hash, expected_hash);
+        // First entry anchors at empty; links are non-empty keyed MACs.
+        assert_eq!(log[0].prev_hash, "");
+        assert!(!log[1].prev_hash.is_empty());
+        // The whole chain verifies under the module's key.
+        assert!(s.verify_chain().is_ok());
+    }
+
+    #[test]
+    fn verify_chain_detects_tampering() {
+        let s = sec();
+        s.verify(&safe_manifest()).unwrap();
+        s.verify(&safe_manifest()).unwrap();
+        // Tamper with the in-memory log directly: flip a detail string.
+        s.audit_log.lock().unwrap()[0].detail.push_str(" TAMPERED");
+        // Because links are keyed MACs, the recomputed link no longer matches.
+        assert!(s.verify_chain().is_err());
+    }
+
+    #[test]
+    fn record_decision_audits_and_sanitises() {
+        let s = sec();
+        // Control characters in detail must not leak into the log.
+        s.record_decision(false, "denied login for user\n\x1b[2Jadmin".into());
+        let log = s.audit_log_snapshot();
+        let last = log.last().unwrap();
+        assert!(matches!(last.kind, DecisionKind::Denial));
+        assert!(!last.detail.contains('\n') && !last.detail.contains('\x1b'));
+        assert!(s.verify_chain().is_ok());
+    }
+
+    #[test]
+    fn with_key_uses_supplied_key() {
+        // Two modules with the SAME key produce the SAME stamp for the same content.
+        let key = [7u8; 32];
+        let a = SecurityModule::with_key(key, SecurityPolicy::permissive());
+        let b = SecurityModule::with_key(key, SecurityPolicy::permissive());
+        let content = b"session-payload";
+        assert_eq!(a.stamp(content), b.stamp(content));
+        assert!(b.is_valid(&a.stamp(content), content));
     }
 
     #[test]

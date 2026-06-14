@@ -13,7 +13,7 @@ use std::sync::Mutex;
 use uuid::Uuid;
 use wyrtloom_core::kanban::{
     BlockReason, is_legal_transition, KanbanBoard, KanbanError, NewTask, StateChange,
-    Task, TaskState,
+    Task, TaskQuery, TaskState,
 };
 use wyrtloom_core::storage::validate_db_path;
 use wyrtloom_core::types::{ActorId, TaskId, Timestamp};
@@ -148,6 +148,51 @@ impl KanbanBoard for SqliteKanbanBoard {
         get_inner(&conn, id)
     }
 
+    fn list(&self, query: &TaskQuery) -> Result<Vec<Task>, KanbanError> {
+        let conn = self.conn.lock().unwrap();
+        // Gather candidate ids in a stable order, then decode each through the
+        // integrity-checked `get_inner` (so malformed rows surface as errors and
+        // the decoding logic never drifts from `get`).
+        let ids: Vec<TaskId> = {
+            let mut stmt = conn
+                .prepare("SELECT id FROM tasks ORDER BY created_at, id")
+                .map_err(|e| KanbanError::Storage(format!("list prepare (code {})", sqlite_code(&e))))?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| KanbanError::Storage(format!("list query (code {})", sqlite_code(&e))))?;
+            let mut ids = Vec::new();
+            for r in rows {
+                let s = r.map_err(|e| KanbanError::Storage(format!("row read (code {})", sqlite_code(&e))))?;
+                let id = Uuid::parse_str(&s)
+                    .map_err(|_| KanbanError::Storage("integrity error: malformed task id".into()))?;
+                ids.push(id);
+            }
+            ids
+        };
+
+        let mut out = Vec::new();
+        for id in ids {
+            let task = get_inner(&conn, id)?;
+            if let Some(states) = &query.states {
+                if !states.contains(&task.state) {
+                    continue;
+                }
+            }
+            if let Some(actor) = &query.actor {
+                if task.actor.as_deref() != Some(actor.as_str()) {
+                    continue;
+                }
+            }
+            out.push(task);
+            if let Some(limit) = query.limit {
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
     fn block(
         &self,
         id: TaskId,
@@ -273,7 +318,7 @@ fn get_inner(conn: &Connection, id: TaskId) -> Result<Task, KanbanError> {
 
     let block_reason: Option<BlockReason> = block_json
         .as_deref()
-        .map(|s| serde_json::from_str(s))
+        .map(serde_json::from_str)
         .transpose()
         .map_err(|_| KanbanError::Storage("integrity error: malformed block_reason".into()))?;
 
@@ -434,6 +479,55 @@ mod tests {
             .transition(task_id, TaskState::Ready, "a".into(), None)
             .unwrap_err();
         assert!(matches!(err, KanbanError::DependenciesNotDone));
+    }
+
+    // read-through-trait: list() enumerates with filters (contract v0.2.0)
+    #[test]
+    fn list_returns_all_tasks_with_history() {
+        let b = board();
+        let a = b.create(new_task("a")).unwrap();
+        let _c = b.create(new_task("c")).unwrap();
+        b.transition(a, TaskState::Todo, "human:alice".into(), None).unwrap();
+
+        let all = b.list(&TaskQuery::default()).unwrap();
+        assert_eq!(all.len(), 2);
+        // The task we moved carries its decoded history.
+        let moved = all.iter().find(|t| t.id == a).unwrap();
+        assert_eq!(moved.state, TaskState::Todo);
+        assert_eq!(moved.history.len(), 1);
+    }
+
+    #[test]
+    fn list_filters_by_state_actor_and_limit() {
+        let b = board();
+        let a = b.create(new_task("a")).unwrap();
+        let b2 = b.create(new_task("b")).unwrap();
+        let _c = b.create(new_task("c")).unwrap();
+        b.transition(a, TaskState::Todo, "x".into(), None).unwrap();
+        b.transition(b2, TaskState::Todo, "x".into(), None).unwrap();
+
+        // state filter
+        let todos = b
+            .list(&TaskQuery { states: Some(vec![TaskState::Todo]), ..Default::default() })
+            .unwrap();
+        assert_eq!(todos.len(), 2);
+        let backlog = b
+            .list(&TaskQuery { states: Some(vec![TaskState::Backlog]), ..Default::default() })
+            .unwrap();
+        assert_eq!(backlog.len(), 1);
+
+        // actor filter (transition clears actor, so claim one to assign)
+        b.transition(a, TaskState::Ready, "x".into(), None).unwrap();
+        b.claim(a, "agent:w".into()).unwrap();
+        let mine = b
+            .list(&TaskQuery { actor: Some("agent:w".into()), ..Default::default() })
+            .unwrap();
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].id, a);
+
+        // limit
+        let limited = b.list(&TaskQuery { limit: Some(2), ..Default::default() }).unwrap();
+        assert_eq!(limited.len(), 2);
     }
 
     // 010 — path traversal is rejected

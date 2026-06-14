@@ -59,6 +59,18 @@ pub struct NewTask {
     pub depends_on: Vec<TaskId>,
 }
 
+/// Read-side filter for enumerating tasks without coupling callers to a
+/// particular storage backend.  `Default` selects every task.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TaskQuery {
+    /// If `Some`, only tasks whose state is in this set are returned.
+    pub states: Option<Vec<TaskState>>,
+    /// If `Some`, only tasks currently assigned to this actor are returned.
+    pub actor: Option<ActorId>,
+    /// If `Some`, at most this many tasks are returned.
+    pub limit: Option<usize>,
+}
+
 #[derive(Error, Debug)]
 pub enum KanbanError {
     #[error("illegal transition from {from:?} to {to:?}")]
@@ -112,6 +124,18 @@ pub trait KanbanBoard: Send + Sync {
         actor: ActorId,
         reason: BlockReason,
     ) -> Result<(), KanbanError>;
+
+    /// Enumerate tasks matching `query` (added in contract v0.2.0).
+    ///
+    /// Defaulted so existing implementations remain source-compatible; a board
+    /// that cannot enumerate returns `Storage(...)` rather than silently empty.
+    /// Storage backends that can list (e.g. the SQLite plugin) override this.
+    fn list(&self, query: &TaskQuery) -> Result<Vec<Task>, KanbanError> {
+        let _ = query;
+        Err(KanbanError::Storage(
+            "enumeration not supported by this board".into(),
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -149,5 +173,22 @@ mod tests {
     #[test]
     fn task_state_display() {
         assert_eq!(TaskState::Running.to_string(), "Running");
+    }
+
+    #[test]
+    fn default_list_reports_unsupported() {
+        struct Dummy;
+        impl KanbanBoard for Dummy {
+            fn create(&self, _: NewTask) -> Result<TaskId, KanbanError> { unimplemented!() }
+            fn transition(&self, _: TaskId, _: TaskState, _: ActorId, _: Option<String>)
+                -> Result<(), KanbanError> { unimplemented!() }
+            fn claim(&self, _: TaskId, _: ActorId) -> Result<(), KanbanError> { unimplemented!() }
+            fn get(&self, _: TaskId) -> Result<Task, KanbanError> { unimplemented!() }
+            fn block(&self, _: TaskId, _: ActorId, _: BlockReason)
+                -> Result<(), KanbanError> { unimplemented!() }
+        }
+        // The default implementation reports unsupported rather than empty.
+        assert!(matches!(Dummy.list(&TaskQuery::default()), Err(KanbanError::Storage(_))));
+        assert!(TaskQuery::default().states.is_none());
     }
 }
