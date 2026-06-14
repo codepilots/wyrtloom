@@ -1340,6 +1340,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "plugin-gate-engine"
+version = "0.1.0"
+dependencies = [
+ "plugin-kanban-sqlite",
+ "plugin-logger-sqlite",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "uuid",
+ "wyrtloom-core",
+]
+
+[[package]]
 name = "plugin-kanban-sqlite"
 version = "0.1.0"
 dependencies = [
