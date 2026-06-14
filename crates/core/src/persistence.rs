@@ -73,9 +73,15 @@ pub trait PersistenceProvider: Send + Sync {
 }
 
 /// Validate a storage identifier (collection or indexed-field name): a lowercase
-/// `[a-z0-9_]` token starting with a letter/digit, 1..=64 chars. This mirrors the
-/// plugin-name rule and exists so implementations can build dynamic SQL safely —
-/// identifiers cannot be bound as parameters, so they must be whitelisted.
+/// `[a-z][a-z0-9_]{0,63}` token (must start with a letter), 1..=64 chars. This
+/// exists so implementations can build dynamic SQL safely — identifiers cannot be
+/// bound as parameters, so they must be whitelisted.
+///
+/// Note: this is intentionally STRICTER than the plugin-name rule
+/// (`crate::plugin::PluginManifest::validate_name`, which also permits `-`):
+/// a `-` is fine in a plugin/path name but is not a safe bare SQL identifier, and
+/// requiring a leading letter avoids all-numeric identifiers that some backends
+/// reject. The two rules are deliberately different.
 pub fn is_valid_identifier(name: &str) -> bool {
     let len = name.len();
     if len == 0 || len > 64 {
@@ -83,11 +89,10 @@ pub fn is_valid_identifier(name: &str) -> bool {
     }
     let mut chars = name.chars();
     let first = chars.next().unwrap();
-    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
+    if !first.is_ascii_lowercase() {
         return false;
     }
-    name.chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
 #[cfg(test)]

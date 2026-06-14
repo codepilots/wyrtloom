@@ -56,27 +56,10 @@ fn validate_base_url(url: &str) -> Result<(), String> {
     }
 }
 
-/// Strip ANSI escape sequences and other control characters from a string
-/// before displaying it on the terminal or including it in an escalation prompt.
-/// Prevents terminal-injection attacks from a malicious or compromised provider.
-pub fn strip_control(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            // Skip until we see an ASCII letter (end of escape sequence).
-            while let Some(&nc) = chars.peek() {
-                chars.next();
-                if nc.is_ascii_alphabetic() { break; }
-            }
-        } else if c.is_control() && c != '\n' && c != '\r' && c != '\t' {
-            // Drop other control characters.
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
+// Terminal-injection stripping is a security control every provider must apply
+// identically, so it lives in core (Ecosystem Lens). Re-exported here for the
+// plugin's existing public API and call sites.
+pub use wyrtloom_core::util::strip_control;
 
 #[derive(Serialize)]
 struct OllamaRequest<'a> {
