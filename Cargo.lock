@@ -1340,6 +1340,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "plugin-insight-artifact"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "uuid",
+ "wyrtloom-core",
+]
+
+[[package]]
 name = "plugin-kanban-sqlite"
 version = "0.1.0"
 dependencies = [
