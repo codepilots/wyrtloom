@@ -31,6 +31,13 @@ pub enum PipelineOutcome {
     Blocked { task_id: TaskId, reason: String },
 }
 
+/// Whether verbose debug logging (full model output, parse errors, blocked
+/// content) is enabled. Gated behind `WYRTLOOM_DEBUG` so model output is not
+/// dumped to stderr in normal operation.
+fn debug_enabled() -> bool {
+    std::env::var_os("WYRTLOOM_DEBUG").is_some()
+}
+
 /// Structured response the LLM must emit (finding 008).
 #[derive(serde::Deserialize)]
 struct LlmResponse {
@@ -124,7 +131,11 @@ impl Pipeline {
         let (is_blocked, content) = match self.provider.generate(req) {
             Ok(resp) => {
                 let raw = resp.full_text();
-                eprintln!("[wyrtloom] LLM raw response: {}", raw);
+                // The full model output can carry sensitive/untrusted content;
+                // only dump it when explicitly debugging (WYRTLOOM_DEBUG set).
+                if debug_enabled() {
+                    eprintln!("[wyrtloom] LLM raw response: {}", raw);
+                }
                 self.logger.record(self.make_call_log(
                     task_id, resp.usage, CallOutcome::Completed,
                 )).ok();
@@ -133,7 +144,9 @@ impl Pipeline {
                 match parse_llm_output(&raw) {
                     Ok(parsed) => parsed,
                     Err(parse_err) => {
-                        eprintln!("[wyrtloom] could not parse LLM output: {}", parse_err);
+                        if debug_enabled() {
+                            eprintln!("[wyrtloom] could not parse LLM output: {}", parse_err);
+                        }
                         // Treat unparseable output as blocked — don't assume success.
                         (true, format!("unparseable LLM output: {}", parse_err))
                     }
@@ -152,7 +165,10 @@ impl Pipeline {
         };
 
         if is_blocked {
-            eprintln!("[wyrtloom] agent blocked: {}", content);
+            // `content` is model-derived; only echo it under WYRTLOOM_DEBUG.
+            if debug_enabled() {
+                eprintln!("[wyrtloom] agent blocked: {}", content);
+            }
             return self.handle_blocked(task_id, title, content);
         }
 

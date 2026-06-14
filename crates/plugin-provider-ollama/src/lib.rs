@@ -64,9 +64,11 @@ fn validate_base_url(raw: &str) -> Result<(), String> {
     // prefix test would have been fooled, and even with parsing we never want
     // credentials in a base URL.
     if !parsed.username().is_empty() || parsed.password().is_some() {
+        // Redact userinfo before echoing the URL: the raw string contains the
+        // `user:pass@` segment, and the password must not leak into the error.
         return Err(format!(
             "base_url '{}' is not permitted: must not contain userinfo (user:pass@)",
-            raw
+            redact_userinfo(&parsed)
         ));
     }
 
@@ -76,9 +78,20 @@ fn validate_base_url(raw: &str) -> Result<(), String> {
         "http" if host == "localhost" || host == "127.0.0.1" => Ok(()),
         _ => Err(format!(
             "base_url '{}' is not permitted: must be http://localhost, http://127.0.0.1, or https://",
-            raw
+            redact_userinfo(&parsed)
         )),
     }
+}
+
+/// Render a URL for an error message with any userinfo (`user:pass@`) stripped,
+/// so a password embedded in the base URL never leaks into a rejection error.
+fn redact_userinfo(parsed: &url::Url) -> String {
+    let mut clean = parsed.clone();
+    // These setters only fail for cannot-be-a-base URLs (e.g. `mailto:`), which
+    // we never reach here (http/https are hierarchical); ignore the Result.
+    let _ = clean.set_username("");
+    let _ = clean.set_password(None);
+    clean.to_string()
 }
 
 /// Read a blocking response body, hard-bounded to `MAX_RESPONSE_BYTES`
@@ -271,6 +284,20 @@ mod tests {
         assert!(OllamaProvider::new("http://127.0.0.1.evil/").is_err());
         // userinfo even on an otherwise-legit localhost host is rejected
         assert!(OllamaProvider::new("http://user:pass@localhost:11434").is_err());
+    }
+
+    // Round-2: the rejection error for a credentialled URL must NOT echo the
+    // password.
+    #[test]
+    fn userinfo_rejection_error_does_not_leak_password() {
+        let err = OllamaProvider::new("http://user:sup3rs3cret@localhost:11434")
+            .err()
+            .expect("credentialled URL must be rejected");
+        assert!(!err.contains("sup3rs3cret"), "password leaked into error: {err}");
+        let err2 = OllamaProvider::new("https://user:hunter2@api.example.com")
+            .err()
+            .expect("credentialled URL must be rejected");
+        assert!(!err2.contains("hunter2"), "password leaked into error: {err2}");
     }
 
     #[test]

@@ -44,7 +44,7 @@ pub fn canonical_request(
 }
 
 /// First-contact enrollment request, authorised by a bootstrap API key.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct EnrollmentRequest {
     /// Single-use bootstrap key, provisioned out of band.
     pub api_key: String,
@@ -53,6 +53,18 @@ pub struct EnrollmentRequest {
     /// The client's public key (DER/PEM/raw per scheme). Required for asymmetric
     /// schemes; the server stores only this + a fingerprint.
     pub public_key: Vec<u8>,
+}
+
+// Custom Debug that redacts the bootstrap `api_key` — a secret that must never
+// reach a Debug/log sink.
+impl std::fmt::Debug for EnrollmentRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EnrollmentRequest")
+            .field("api_key", &"<redacted>")
+            .field("client_name", &self.client_name)
+            .field("public_key", &self.public_key)
+            .finish()
+    }
 }
 
 /// The credential the server hands back / records after enrollment. Carries no
@@ -67,7 +79,7 @@ pub struct ClientCredential {
 
 /// Material presented on a subsequent request for verification: a signature over
 /// a canonical, length-prefixed request descriptor plus anti-replay fields.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct PresentedClientAuth {
     pub client_id: ClientId,
     /// Canonical request bytes that were signed (method/path/body-hash/…,
@@ -78,6 +90,21 @@ pub struct PresentedClientAuth {
     pub timestamp: i64,
     /// Per-request nonce; verifier rejects replays within the skew window.
     pub nonce: String,
+}
+
+// Custom Debug that redacts `signature`. The signature is not a long-lived
+// secret, but it is sensitive authentication material that should not be echoed
+// into logs (and keeps Debug from dumping raw auth bytes).
+impl std::fmt::Debug for PresentedClientAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PresentedClientAuth")
+            .field("client_id", &self.client_id)
+            .field("canonical_request", &self.canonical_request)
+            .field("signature", &"<redacted>")
+            .field("timestamp", &self.timestamp)
+            .field("nonce", &self.nonce)
+            .finish()
+    }
 }
 
 /// A verified client identity.

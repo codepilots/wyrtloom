@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::Duration;
 use wasmtime::{Config, Engine, Linker, Module, ResourceLimiter, Store};
 use wyrtloom_core::sandbox::{ResourceLimits, SafeModule, SandboxError, SandboxRuntime};
@@ -24,6 +25,12 @@ use wyrtloom_core::types::Bytes;
 /// number of ticks (`ceil(max_wallclock_ms / TICK_MS)`), giving wall-clock
 /// timeout resolution of one tick.
 const TICK_MS: u64 = 1;
+
+/// Hard upper bound on table element count (finding 027). A module that declares
+/// a table with no maximum would otherwise be bounded only by fuel/epoch; this
+/// caps growth so a no-max table can't be grown unboundedly within a single
+/// call. 10M function-reference slots is far above any legitimate guest need.
+const MAX_TABLE_ELEMS: u32 = 10_000_000;
 
 /// Per-store data: enforces the memory cap (finding 023) via `ResourceLimiter`.
 struct StoreLimits {
@@ -49,8 +56,11 @@ impl ResourceLimiter for StoreLimits {
         desired: u32,
         maximum: Option<u32>,
     ) -> wasmtime::Result<bool> {
-        // No extra table cap beyond the module's own declared maximum.
-        Ok(maximum.map(|m| desired <= m).unwrap_or(true))
+        // Enforce BOTH the module's own declared maximum (if any) AND a hard
+        // absolute cap, so a table that declares no maximum cannot be grown
+        // unboundedly (previously bounded only by fuel/epoch).
+        let within_module_max = maximum.map(|m| desired <= m).unwrap_or(true);
+        Ok(within_module_max && desired <= MAX_TABLE_ELEMS)
     }
 }
 
@@ -60,6 +70,9 @@ pub struct WasmtimeSandbox {
     module_cache: Mutex<HashMap<[u8; 32], Module>>,
     /// Set on drop to stop the background epoch ticker thread.
     ticker_stop: Arc<AtomicBool>,
+    /// Handle to the background epoch ticker, joined on Drop so the thread and
+    /// its `Arc<Engine>` are released deterministically.
+    ticker: Option<JoinHandle<()>>,
 }
 
 impl WasmtimeSandbox {
@@ -77,7 +90,7 @@ impl WasmtimeSandbox {
         // shared clock is sound under concurrent executions and spawns no
         // per-call threads.
         let ticker_stop = Arc::new(AtomicBool::new(false));
-        {
+        let ticker = {
             let engine = Arc::clone(&engine);
             let stop = Arc::clone(&ticker_stop);
             std::thread::spawn(move || {
@@ -85,20 +98,27 @@ impl WasmtimeSandbox {
                     std::thread::sleep(Duration::from_millis(TICK_MS));
                     engine.increment_epoch();
                 }
-            });
-        }
+            })
+        };
 
         Ok(Self {
             engine,
             module_cache: Mutex::new(HashMap::new()),
             ticker_stop,
+            ticker: Some(ticker),
         })
     }
 }
 
 impl Drop for WasmtimeSandbox {
     fn drop(&mut self) {
+        // Signal the ticker to stop, then JOIN it so the thread (and the
+        // `Arc<Engine>` it holds) is released deterministically before this
+        // sandbox is fully dropped. The thread wakes within one TICK_MS.
         self.ticker_stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.ticker.take() {
+            let _ = handle.join();
+        }
     }
 }
 

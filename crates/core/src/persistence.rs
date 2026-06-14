@@ -25,10 +25,22 @@ pub struct CollectionSpec {
 }
 
 /// A stored document: an opaque JSON value addressed by a string id.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Record {
     pub id: String,
     pub doc: serde_json::Value,
+}
+
+// Custom Debug that omits `doc`: a document may hold password hashes, keys, or
+// other secret-bearing fields, so it must not be dumped to a Debug/log sink.
+// Only the id is printed, with a `<redacted>` marker for the document.
+impl std::fmt::Debug for Record {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Record")
+            .field("id", &self.id)
+            .field("doc", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Read query over a collection.
@@ -70,6 +82,22 @@ pub trait PersistenceProvider: Send + Sync {
     fn query(&self, collection: &str, query: &Query) -> Result<Vec<Record>, StoreError>;
     /// Delete a record by id (no-op if absent).
     fn delete(&self, collection: &str, id: &str) -> Result<(), StoreError>;
+
+    /// Atomically insert only if `record.id` is absent. Returns Ok(true) if
+    /// inserted, Ok(false) if it already existed. Implementations MUST make this
+    /// atomic — it backs single-use tokens. The default is a NON-atomic
+    /// get-then-put fallback (NOT safe for cross-process single-use); real stores
+    /// override it.
+    fn put_if_absent(&self, collection: &str, record: Record) -> Result<bool, StoreError> {
+        match self.get(collection, &record.id) {
+            Ok(_) => Ok(false),
+            Err(StoreError::NotFound(_)) => {
+                self.put(collection, record)?;
+                Ok(true)
+            }
+            Err(e) => Err(e),
+        }
+    }
 }
 
 /// Validate a storage identifier (collection or indexed-field name): a lowercase
@@ -121,6 +149,65 @@ mod tests {
         ] {
             assert!(!is_valid_identifier(n), "should reject {n:?}");
         }
+    }
+
+    // Round-2: Record's Debug must not dump the document (it may hold secrets).
+    #[test]
+    fn record_debug_redacts_doc() {
+        let r = Record {
+            id: "u1".into(),
+            doc: serde_json::json!({ "password_hash": "argon2-very-secret" }),
+        };
+        let dbg = format!("{r:?}");
+        assert!(dbg.contains("u1"), "id should be shown: {dbg}");
+        assert!(dbg.contains("<redacted>"), "doc must be redacted: {dbg}");
+        assert!(!dbg.contains("argon2-very-secret"), "secret leaked: {dbg}");
+    }
+
+    // Round-2: contract test for the default (non-atomic) put_if_absent fallback.
+    #[test]
+    fn put_if_absent_default_inserts_then_refuses_duplicate() {
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+
+        // Minimal in-memory store that does NOT override put_if_absent, so the
+        // trait default is exercised.
+        #[derive(Default)]
+        struct MemStore {
+            data: Mutex<HashMap<String, Record>>,
+        }
+        impl PersistenceProvider for MemStore {
+            fn ensure_collection(&self, _spec: &CollectionSpec) -> Result<(), StoreError> {
+                Ok(())
+            }
+            fn put(&self, _collection: &str, record: Record) -> Result<(), StoreError> {
+                self.data.lock().unwrap().insert(record.id.clone(), record);
+                Ok(())
+            }
+            fn get(&self, _collection: &str, id: &str) -> Result<Record, StoreError> {
+                self.data
+                    .lock()
+                    .unwrap()
+                    .get(id)
+                    .cloned()
+                    .ok_or_else(|| StoreError::NotFound(id.to_string()))
+            }
+            fn query(&self, _collection: &str, _query: &Query) -> Result<Vec<Record>, StoreError> {
+                Ok(self.data.lock().unwrap().values().cloned().collect())
+            }
+            fn delete(&self, _collection: &str, id: &str) -> Result<(), StoreError> {
+                self.data.lock().unwrap().remove(id);
+                Ok(())
+            }
+        }
+
+        let store = MemStore::default();
+        let rec = Record { id: "tok-1".into(), doc: serde_json::json!({}) };
+
+        // First insert succeeds.
+        assert!(store.put_if_absent("tokens", rec.clone()).unwrap());
+        // Second insert of the same id is refused (single-use semantics).
+        assert!(!store.put_if_absent("tokens", rec).unwrap());
     }
 
     #[test]
