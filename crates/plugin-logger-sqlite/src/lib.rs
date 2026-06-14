@@ -52,7 +52,11 @@ impl SqliteCallLogger {
         )
     }
 
-    pub fn all_logs(&self) -> Result<Vec<CallLog>, LogError> {
+}
+
+
+impl CallLogger for SqliteCallLogger {
+    fn all_logs(&self) -> Result<Vec<CallLog>, LogError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
@@ -111,7 +115,7 @@ impl SqliteCallLogger {
             // 011 — invalid timestamp is an integrity error.
             let at = chrono::DateTime::parse_from_rfc3339(&at_str)
                 .map(|dt| Timestamp(dt.with_timezone(&chrono::Utc)))
-                .map_err(|_| LogError::Storage(format!("integrity error: malformed timestamp")))?;
+                .map_err(|_| LogError::Storage("integrity error: malformed timestamp".to_string()))?;
 
             logs.push(CallLog {
                 task,
@@ -125,10 +129,7 @@ impl SqliteCallLogger {
         }
         Ok(logs)
     }
-}
 
-
-impl CallLogger for SqliteCallLogger {
     fn record(&self, entry: CallLog) -> Result<(), LogError> {
         let (outcome_str, outcome_detail) = match &entry.outcome {
             CallOutcome::Completed  => ("Completed", None),
