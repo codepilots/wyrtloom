@@ -1340,6 +1340,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "plugin-interest-router"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror 1.0.69",
+ "uuid",
+ "wyrtloom-core",
+]
+
+[[package]]
 name = "plugin-kanban-sqlite"
 version = "0.1.0"
 dependencies = [

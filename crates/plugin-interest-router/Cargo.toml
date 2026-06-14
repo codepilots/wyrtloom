@@ -1,0 +1,13 @@
+[package]
+name    = "plugin-interest-router"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+wyrtloom-core = { workspace = true }
+serde         = { workspace = true }
+thiserror     = { workspace = true }
+
+[dev-dependencies]
+uuid = { workspace = true }
