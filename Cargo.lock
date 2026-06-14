@@ -1340,6 +1340,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "plugin-hunt-harness"
+version = "0.1.0"
+dependencies = [
+ "plugin-sandbox-wasmtime",
+ "serde",
+ "thiserror 1.0.69",
+ "uuid",
+ "wat",
+ "wyrtloom-core",
+]
+
+[[package]]
 name = "plugin-kanban-sqlite"
 version = "0.1.0"
 dependencies = [
