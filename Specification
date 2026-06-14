@@ -151,6 +151,8 @@ Every candidate for the core was tested against two questions. These lenses are 
 
 A useful corollary, learned the hard way by other projects: **if an interface is hard to test, it is probably the wrong shape.** Difficulty writing a clean contract test is a design signal, not merely an inconvenience.
 
+**Ecosystem corollary — one repo per swappable implementation.** Any reusable, swappable capability — including persistence itself — SHALL be expressed as a versioned core *contract* whose implementation ships as a **separate plugin in its own repository**; consumers depend on the contract, never on a concrete plugin. Persistence is abstracted behind the `wyrtloom.persistence` document-store contract so the backing store is swappable; user management (`wyrtloom.users`) and client authentication (`wyrtloom.client_auth`) follow the same rule. Backend/API services are built client-agnostic (web, mobile, CLI are all just clients), and security-sensitive concerns are wired to the core security module (stamping into the tamper-evident audit chain), with session/expiry/revocation enforced in the consuming service since the core provides integrity, not session semantics.
+
 ## 8. The bootstrap sequence
 
 The core initialises in a strict, defined order. Security comes first and verifies each subsequent stage. Untrusted code never loads until the gate is standing.

@@ -2,6 +2,30 @@
 
 ---
 
+## Core extensions for the dashboard ecosystem (2026-06-14)
+
+Additive, backward-compatible core changes that enable a separate-repo dashboard ecosystem
+(read-through-trait board access, swappable persistence/users/client-auth, hardened audit).
+
+- **Kanban read-through-trait:** `KanbanBoard::list(&TaskQuery)` (defaulted, so existing impls keep
+  compiling) + `TaskQuery { states, actor, limit }`; implemented in `plugin-kanban-sqlite` via the
+  integrity-checked decoder. The kanban contract floor stays `0.1.0` (additive); list-capable plugins
+  declare `0.2.0`.
+- **Three new interface contracts** (implementations ship as separate plugin repos):
+  `wyrtloom.persistence` (document/collection store, with `is_valid_identifier` to keep dynamic SQL
+  safe), `wyrtloom.users` (argon2/RBAC directory), `wyrtloom.client_auth` (TOFU asymmetric client auth).
+- **Security module hardening (audit-driven):** `record_decision()` (audit access decisions),
+  `with_key()` (persisted signing key — stable stamps/anchor across restart), keyed-MAC audit-chain
+  links + `verify_chain()` (tamper detection a plain hash-chain misses), and `sanitize_detail()`
+  (log-injection guard).
+- **Observability:** `main.rs` honours `WYRTLOOM_KANBAN_DB` / `WYRTLOOM_LOGGER_DB` for on-disk DBs.
+- **Design guide:** the Ecosystem-Lens corollary "one repo per swappable implementation; persistence is
+  a contract" added to `Specification`.
+
+Tests: 267 → 280, all green; clippy clean.
+
+---
+
 ## Code-review fixes (2026-06-07)
 
 Ten findings from an internal code review addressed.

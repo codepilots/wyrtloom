@@ -15,6 +15,28 @@ use wyrtloom_core::types::SemVer;
 
 use pipeline::{Pipeline, PipelineOutcome};
 
+/// Open the kanban board on disk when `env_var` is set to a path, else in-memory.
+fn open_kanban(env_var: &str) -> anyhow::Result<SqliteKanbanBoard> {
+    match std::env::var(env_var) {
+        Ok(path) if !path.is_empty() => {
+            println!("[boot] kanban DB: {path}");
+            Ok(SqliteKanbanBoard::open(&path)?)
+        }
+        _ => Ok(SqliteKanbanBoard::in_memory()?),
+    }
+}
+
+/// Open the call logger on disk when `env_var` is set to a path, else in-memory.
+fn open_logger(env_var: &str) -> anyhow::Result<SqliteCallLogger> {
+    match std::env::var(env_var) {
+        Ok(path) if !path.is_empty() => {
+            println!("[boot] logger DB: {path}");
+            Ok(SqliteCallLogger::open(&path)?)
+        }
+        _ => Ok(SqliteCallLogger::in_memory()?),
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     println!("🌿 Wyrtloom v0.1 — The Seed");
     println!("================================\n");
@@ -25,10 +47,11 @@ fn main() -> anyhow::Result<()> {
     bootstrapper.register_plugin(
         PluginManifest {
             name: "plugin-kanban-sqlite".into(),
-            version: SemVer::new(0, 1, 0),
+            version: SemVer::new(0, 2, 0),
             class: PluginClass::Unsafe,
             capabilities: vec![Capability::FileWrite(".".into())],
-            implements: vec![("wyrtloom.kanban".into(), SemVer::new(0, 1, 0))],
+            // Declares 0.2.0 — provides the additive `KanbanBoard::list` (read-through-trait).
+            implements: vec![("wyrtloom.kanban".into(), SemVer::new(0, 2, 0))],
         },
         || Arc::new(()),
     );
@@ -90,10 +113,13 @@ fn main() -> anyhow::Result<()> {
     println!("[boot] {} security decisions recorded", audit.len());
 
     // ── Instantiate plugin implementations ────────────────────────────────────
-    let kanban   = Arc::new(SqliteKanbanBoard::in_memory()?);
+    // Persist to an on-disk DB when WYRTLOOM_KANBAN_DB / WYRTLOOM_LOGGER_DB are set,
+    // so a separate process (e.g. the dashboard) can observe the board; otherwise
+    // stay in-memory as before.
+    let kanban   = Arc::new(open_kanban("WYRTLOOM_KANBAN_DB")?);
     // OllamaProvider::new() is now fallible — URL validated at construction.
     let provider = Arc::new(OllamaProvider::default_local());
-    let logger   = Arc::new(SqliteCallLogger::in_memory()?);
+    let logger   = Arc::new(open_logger("WYRTLOOM_LOGGER_DB")?);
     // WasmtimeSandbox::new() is explicitly fallible; no Default impl (finding 019).
     let sandbox  = WasmtimeSandbox::new()?;
 

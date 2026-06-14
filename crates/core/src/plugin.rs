@@ -106,12 +106,20 @@ pub struct CoreContractVersions(pub HashMap<ContractId, SemVer>);
 impl CoreContractVersions {
     pub fn v0_1() -> Self {
         let mut m = HashMap::new();
-        m.insert("wyrtloom.kanban".into(),     SemVer::new(0, 1, 0));
-        m.insert("wyrtloom.provider".into(),   SemVer::new(0, 1, 0));
-        m.insert("wyrtloom.sandbox".into(),    SemVer::new(0, 1, 0));
-        m.insert("wyrtloom.logger".into(),     SemVer::new(0, 1, 0));
-        m.insert("wyrtloom.escalation".into(), SemVer::new(0, 1, 0));
-        m.insert("wyrtloom.bus".into(),        SemVer::new(0, 1, 0));
+        // kanban floor stays 0.1.0 (backward-compatible): `KanbanBoard::list` is an
+        // additive, defaulted method, so 0.1.0 plugins still satisfy the trait.
+        // List-capable storage plugins (e.g. kanban-sqlite) DECLARE 0.2.0, which is
+        // compatible with this 0.1.0 floor.
+        m.insert("wyrtloom.kanban".into(),      SemVer::new(0, 1, 0));
+        m.insert("wyrtloom.provider".into(),    SemVer::new(0, 1, 0));
+        m.insert("wyrtloom.sandbox".into(),     SemVer::new(0, 1, 0));
+        m.insert("wyrtloom.logger".into(),      SemVer::new(0, 1, 0));
+        m.insert("wyrtloom.escalation".into(),  SemVer::new(0, 1, 0));
+        m.insert("wyrtloom.bus".into(),         SemVer::new(0, 1, 0));
+        // New contracts (implementations ship as separate plugin repos).
+        m.insert("wyrtloom.persistence".into(), SemVer::new(0, 1, 0));
+        m.insert("wyrtloom.users".into(),       SemVer::new(0, 1, 0));
+        m.insert("wyrtloom.client_auth".into(), SemVer::new(0, 1, 0));
         Self(m)
     }
 
