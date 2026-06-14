@@ -31,6 +31,12 @@ pub enum LogError {
 /// future ML tuner.  Failed or partial calls are logged, never silently dropped.
 pub trait CallLogger: Send + Sync {
     fn record(&self, entry: CallLog) -> Result<(), LogError>;
+
+    /// Return all recorded call logs. Implementations that do not retain
+    /// readable history (e.g. write-only sinks) return an empty vec by default.
+    fn all_logs(&self) -> Result<Vec<CallLog>, LogError> {
+        Ok(Vec::new())
+    }
 }
 
 #[cfg(test)]

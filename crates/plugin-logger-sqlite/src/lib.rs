@@ -52,7 +52,11 @@ impl SqliteCallLogger {
         )
     }
 
-    pub fn all_logs(&self) -> Result<Vec<CallLog>, LogError> {
+}
+
+
+impl CallLogger for SqliteCallLogger {
+    fn all_logs(&self) -> Result<Vec<CallLog>, LogError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
@@ -125,10 +129,7 @@ impl SqliteCallLogger {
         }
         Ok(logs)
     }
-}
 
-
-impl CallLogger for SqliteCallLogger {
     fn record(&self, entry: CallLog) -> Result<(), LogError> {
         let (outcome_str, outcome_detail) = match &entry.outcome {
             CallOutcome::Completed  => ("Completed", None),
