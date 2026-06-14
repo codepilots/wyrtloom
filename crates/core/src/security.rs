@@ -23,6 +23,11 @@ use thiserror::Error;
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Upper bound on the on-disk audit file accepted by [`SecurityModule::with_audit_file`].
+/// A larger file is refused rather than read into memory (OOM guard against an
+/// attacker-written audit file).
+const MAX_AUDIT_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
 // ---------------------------------------------------------------------------
 // Stamp — HMAC-SHA256 bound to message content
 // ---------------------------------------------------------------------------
@@ -31,8 +36,16 @@ type HmacSha256 = Hmac<Sha256>;
 /// Internally stores the 32-byte HMAC so `is_valid()` can verify it
 /// without a separate lookup table for the issued set.
 /// A stamp is invalidated when the message it was issued for is transformed.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Stamp(pub [u8; 32]);
+
+// Custom Debug that redacts the MAC bytes: the MAC is the secret half of the
+// dashboard session token, so it must never reach a Debug/log sink.
+impl std::fmt::Debug for Stamp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Stamp(<redacted ref={}>)", stamp_ref(&self.0))
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Security policy
@@ -178,15 +191,21 @@ impl SecurityModule {
     ///
     /// Finding 028:
     /// (a) The file is opened/created with mode 0600 (owner read/write only) so
-    ///     the tamper-evident log is not world-readable; permissions are also
-    ///     defensively re-applied for a pre-existing file.
+    ///     the tamper-evident log is not world-readable; permissions are applied
+    ///     via `fchmod` on the open fd (no path-based TOCTOU window).
     /// (b) If the file already has content, the chain is re-anchored from its
     ///     LAST line so new entries link onto the old ones across a restart,
     ///     rather than resetting `prev_hash` to "" and forking the chain.
+    /// (c) The load reads through the same open fd (bounded to [`MAX_AUDIT_FILE_BYTES`]),
+    ///     so an attacker-written file cannot OOM us and a swapped symlink cannot
+    ///     feed a different inode than the one we chmodded.
+    /// (d) After loading, the re-anchored chain is **verified**; a tampered file
+    ///     is rejected (`IntegrityFailure`) at open rather than blindly trusted.
     pub fn with_audit_file(mut self, path: &str) -> Result<Self, SecurityError> {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        use std::io::{Read, Seek, SeekFrom};
+        use std::os::unix::fs::OpenOptionsExt;
 
-        let f = OpenOptions::new()
+        let mut f = OpenOptions::new()
             .create(true)
             .append(true)
             .read(true)
@@ -194,16 +213,35 @@ impl SecurityModule {
             .open(path)
             .map_err(|e| SecurityError::IntegrityFailure(format!("audit file: {}", e)))?;
 
-        // Defensively tighten permissions on a file that already existed (the
-        // `.mode()` above only applies to a freshly-created file).
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        // Defensively tighten permissions via fchmod on the OPEN fd, so a
+        // pre-existing file is locked down with no path-based TOCTOU window
+        // (a path-based set_permissions could be redirected by a swapped symlink
+        // between open and chmod).
+        fchmod_0600(&f)
             .map_err(|e| SecurityError::IntegrityFailure(format!("audit file perms: {}", e)))?;
 
-        // Load the existing persisted entries into the in-memory log and
-        // re-anchor the hash chain from the last one, so `verify_chain` covers
-        // the restart boundary and new entries link onto the old ones.
-        let existing = std::fs::read_to_string(path)
+        // Load the existing persisted entries by reading the SAME open fd `f`
+        // that was opened, stat'd, and chmodded — never re-opening by path — so
+        // a swapped symlink cannot feed us a different inode than the one we
+        // locked down. The read is hard-bounded to MAX_AUDIT_FILE_BYTES + 1 via
+        // `take`: an attacker-written (or concurrently-growing) file cannot OOM
+        // us, and exceeding the cap is rejected. (`append` mode leaves the read
+        // cursor at 0, but seek to start explicitly to be robust.)
+        f.seek(SeekFrom::Start(0))
+            .map_err(|e| SecurityError::IntegrityFailure(format!("audit file seek: {}", e)))?;
+        let mut bytes = Vec::new();
+        let mut limited = (&f).take(MAX_AUDIT_FILE_BYTES + 1);
+        limited
+            .read_to_end(&mut bytes)
             .map_err(|e| SecurityError::IntegrityFailure(format!("audit file read: {}", e)))?;
+        if bytes.len() as u64 > MAX_AUDIT_FILE_BYTES {
+            return Err(SecurityError::IntegrityFailure(format!(
+                "audit file too large: exceeds {} byte cap",
+                MAX_AUDIT_FILE_BYTES
+            )));
+        }
+        let existing = String::from_utf8(bytes)
+            .map_err(|_| SecurityError::IntegrityFailure("audit file is not valid UTF-8".into()))?;
         {
             let mut log = self.audit_log.lock().unwrap();
             let mut last = self.last_hash.lock().unwrap();
@@ -221,6 +259,11 @@ impl SecurityModule {
                 log.push(entry);
             }
         }
+
+        // Fail closed: a tampered file must be rejected at open, not trusted.
+        // `verify_chain` recomputes the keyed links over the loaded entries and
+        // errors on the first broken link (in-place mutation / reorder / deletion).
+        self.verify_chain()?;
 
         self.audit_file = Some(Mutex::new(f));
         Ok(self)
@@ -283,7 +326,11 @@ impl SecurityModule {
     /// The stamp is an HMAC-SHA256 over the content bytes.
     pub fn stamp(&self, content: &[u8]) -> Stamp {
         let mac = self.compute_mac(content);
-        self.audit(DecisionKind::StampIssued, format!("stamp {}", hex(&mac)));
+        // Never log the raw MAC: the dashboard session token's MAC half IS this
+        // stamp, so it would leak into the 0600 audit file and GET /api/audit.
+        // Log a non-reversible reference (truncated SHA-256 of the MAC) instead —
+        // enough to correlate issue/invalidate without disclosing the secret.
+        self.audit(DecisionKind::StampIssued, format!("stamp issued ref={}", stamp_ref(&mac)));
         Stamp(mac)
     }
 
@@ -303,7 +350,8 @@ impl SecurityModule {
 
     /// Invalidate a stamp when the message it covers is transformed.
     pub fn invalidate(&self, stamp: Stamp) {
-        self.audit(DecisionKind::StampInvalidated, format!("stamp {}", hex(&stamp.0)));
+        // Same as `stamp()`: log a non-reversible reference, not the raw MAC.
+        self.audit(DecisionKind::StampInvalidated, format!("stamp invalidated ref={}", stamp_ref(&stamp.0)));
         self.invalidated.lock().unwrap().insert(stamp);
     }
 
@@ -434,6 +482,25 @@ impl Default for SecurityModule {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Non-reversible audit reference for a stamp/session MAC: the first 8 bytes of
+/// SHA-256(mac), hex-encoded. Logging this instead of the raw MAC lets an
+/// operator correlate a stamp's issue and invalidation without disclosing the
+/// MAC itself (which doubles as the dashboard session token's secret half).
+fn stamp_ref(mac: &[u8; 32]) -> String {
+    use sha2::Digest;
+    let digest = Sha256::digest(mac);
+    hex(&digest[..8])
+}
+
+/// Set mode 0600 on an already-open file. `File::set_permissions` operates on the
+/// open fd (it is `fchmod` under the hood), so it closes the TOCTOU window a
+/// path-based `set_permissions` leaves open between open and chmod — a swapped
+/// symlink can't redirect it.
+fn fchmod_0600(f: &File) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))
 }
 
 /// HMAC-SHA256 of `content` under `key`.
@@ -732,6 +799,108 @@ mod tests {
 
             // The whole chain — across the restart boundary — verifies.
             assert!(s.verify_chain().is_ok());
+        }
+
+        let _ = std::fs::remove_file(path_str);
+    }
+
+    // Round-2: the stamp/invalidate audit detail must NOT contain the raw MAC.
+    #[test]
+    fn stamp_audit_detail_does_not_leak_mac() {
+        let s = sec();
+        let content = b"session-payload";
+        let stamp = s.stamp(content);
+        s.invalidate(stamp.clone());
+        let raw_mac_hex = hex(&stamp.0);
+        for entry in s.audit_log_snapshot() {
+            assert!(
+                !entry.detail.contains(&raw_mac_hex),
+                "raw MAC leaked into audit detail: {}",
+                entry.detail
+            );
+            // The attestation marker and a non-reversible ref are preserved.
+            if matches!(entry.kind, DecisionKind::StampIssued) {
+                assert!(entry.detail.starts_with("stamp issued ref="));
+            }
+            if matches!(entry.kind, DecisionKind::StampInvalidated) {
+                assert!(entry.detail.starts_with("stamp invalidated ref="));
+            }
+        }
+        // The ref is the truncated SHA-256 of the MAC (16 hex chars), not the MAC.
+        assert_eq!(stamp_ref(&stamp.0).len(), 16);
+        assert_ne!(stamp_ref(&stamp.0), raw_mac_hex);
+    }
+
+    // Round-2: the custom Debug impl for Stamp must redact the MAC bytes.
+    #[test]
+    fn stamp_debug_redacts_mac() {
+        let s = sec();
+        let stamp = s.stamp(b"secret");
+        let dbg = format!("{:?}", stamp);
+        assert!(dbg.contains("redacted"), "Debug must mark redaction: {dbg}");
+        assert!(!dbg.contains(&hex(&stamp.0)), "Debug must not print raw MAC: {dbg}");
+    }
+
+    // Round-2: a tampered middle line makes with_audit_file fail closed.
+    #[test]
+    fn tampered_audit_file_is_rejected_on_open() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("wyrtloom-audit-tamper-{}.jsonl", Uuid::new_v4()));
+        let path_str = path.to_str().unwrap();
+        let key = [11u8; 32];
+
+        // Write three entries, then drop.
+        {
+            let s = SecurityModule::with_key(key, SecurityPolicy::permissive())
+                .with_audit_file(path_str)
+                .unwrap();
+            s.verify(&safe_manifest()).unwrap();
+            s.verify(&safe_manifest()).unwrap();
+            s.verify(&safe_manifest()).unwrap();
+        }
+
+        // Tamper with the MIDDLE line's detail in-place.
+        let contents = std::fs::read_to_string(path_str).unwrap();
+        let mut lines: Vec<String> = contents.lines().map(|l| l.to_string()).collect();
+        assert!(lines.len() >= 3);
+        let mut mid: SecurityDecision = serde_json::from_str(&lines[1]).unwrap();
+        mid.detail.push_str(" TAMPERED");
+        lines[1] = serde_json::to_string(&mid).unwrap();
+        std::fs::write(path_str, lines.join("\n") + "\n").unwrap();
+
+        // Reopening with the same key must fail closed (chain no longer verifies).
+        let result = SecurityModule::with_key(key, SecurityPolicy::permissive())
+            .with_audit_file(path_str);
+        match result {
+            Err(SecurityError::IntegrityFailure(_)) => {}
+            Err(other) => panic!("expected IntegrityFailure, got {other:?}"),
+            Ok(_) => panic!("tampered audit file must be rejected on open"),
+        }
+
+        let _ = std::fs::remove_file(path_str);
+    }
+
+    // Round-2: an audit file above the byte cap is refused at open (OOM guard),
+    // and the load reads through the open fd, not a re-opened path.
+    #[test]
+    fn oversized_audit_file_is_rejected_on_open() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("wyrtloom-audit-big-{}.jsonl", Uuid::new_v4()));
+        let path_str = path.to_str().unwrap();
+
+        // Write a file just over the cap of newline bytes (cheap; no parsing
+        // needed because the cap trips before any line is parsed).
+        let oversized = vec![b'\n'; (MAX_AUDIT_FILE_BYTES + 1) as usize];
+        std::fs::write(path_str, &oversized).unwrap();
+
+        let result = SecurityModule::with_key([5u8; 32], SecurityPolicy::permissive())
+            .with_audit_file(path_str);
+        match result {
+            Err(SecurityError::IntegrityFailure(msg)) => {
+                assert!(msg.contains("too large"), "got {msg}");
+            }
+            Err(other) => panic!("expected too-large IntegrityFailure, got {other:?}"),
+            Ok(_) => panic!("oversized audit file must be rejected"),
         }
 
         let _ = std::fs::remove_file(path_str);

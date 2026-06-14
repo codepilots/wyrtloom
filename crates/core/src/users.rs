@@ -43,11 +43,23 @@ impl User {
 
 /// Request to create a user. The password is plaintext only in transit to the
 /// implementation, which MUST hash it (argon2id) before storage.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct NewUser {
     pub username: ActorId,
     pub password: String,
     pub roles: Vec<Role>,
+}
+
+// Custom Debug that redacts the plaintext `password` so it never reaches a
+// Debug/log sink.
+impl std::fmt::Debug for NewUser {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NewUser")
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .field("roles", &self.roles)
+            .finish()
+    }
 }
 
 #[derive(Error, Debug)]
