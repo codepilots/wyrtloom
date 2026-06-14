@@ -1377,6 +1377,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "plugin-rationale-ledger"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "uuid",
+ "wyrtloom-core",
+]
+
+[[package]]
 name = "plugin-sandbox-wasmtime"
 version = "0.1.0"
 dependencies = [
