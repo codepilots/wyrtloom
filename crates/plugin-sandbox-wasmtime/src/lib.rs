@@ -7,17 +7,59 @@
 ///   014 – Compiled modules are cached by SHA-256 of their WASM bytes to
 ///         prevent repeated Cranelift compilation (CPU DoS vector).
 ///   019 – Default trait impl removed; construction is now explicitly fallible.
+///   023 – ResourceLimits.max_memory_bytes is enforced via a wasmtime
+///         ResourceLimiter that rejects memory growth beyond the cap.
+///   024 – A single background epoch-ticker thread drives wall-clock timeouts;
+///         the previous per-call thread both raced under concurrency and was a
+///         per-execution thread-spawn DoS vector.
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use wasmtime::{Config, Engine, Linker, Module, Store};
+use wasmtime::{Config, Engine, Linker, Module, ResourceLimiter, Store};
 use wyrtloom_core::sandbox::{ResourceLimits, SafeModule, SandboxError, SandboxRuntime};
 use wyrtloom_core::types::Bytes;
+
+/// Cadence of the background epoch ticker. Per-call deadlines are expressed as a
+/// number of ticks (`ceil(max_wallclock_ms / TICK_MS)`), giving wall-clock
+/// timeout resolution of one tick.
+const TICK_MS: u64 = 1;
+
+/// Per-store data: enforces the memory cap (finding 023) via `ResourceLimiter`.
+struct StoreLimits {
+    max_memory_bytes: usize,
+}
+
+impl ResourceLimiter for StoreLimits {
+    fn memory_growing(
+        &mut self,
+        _current: usize,
+        desired: usize,
+        _maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        // Reject growth past the configured cap. Returning Ok(false) makes the
+        // guest's memory.grow yield -1; an explicit allocation past the limit
+        // (e.g. linear-memory initialisation) then traps.
+        Ok(desired <= self.max_memory_bytes)
+    }
+
+    fn table_growing(
+        &mut self,
+        _current: u32,
+        desired: u32,
+        maximum: Option<u32>,
+    ) -> wasmtime::Result<bool> {
+        // No extra table cap beyond the module's own declared maximum.
+        Ok(maximum.map(|m| desired <= m).unwrap_or(true))
+    }
+}
 
 pub struct WasmtimeSandbox {
     engine: Arc<Engine>,
     /// Cache of compiled modules keyed by SHA-256 of the WASM bytes.
     module_cache: Mutex<HashMap<[u8; 32], Module>>,
+    /// Set on drop to stop the background epoch ticker thread.
+    ticker_stop: Arc<AtomicBool>,
 }
 
 impl WasmtimeSandbox {
@@ -28,10 +70,35 @@ impl WasmtimeSandbox {
         config.epoch_interruption(true);
         let engine =
             Engine::new(&config).map_err(|e| SandboxError::Compile(e.to_string()))?;
+        let engine = Arc::new(engine);
+
+        // 024 — a SINGLE background ticker increments the global epoch at a
+        // fixed cadence. Per-call deadlines are relative tick counts, so this
+        // shared clock is sound under concurrent executions and spawns no
+        // per-call threads.
+        let ticker_stop = Arc::new(AtomicBool::new(false));
+        {
+            let engine = Arc::clone(&engine);
+            let stop = Arc::clone(&ticker_stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(TICK_MS));
+                    engine.increment_epoch();
+                }
+            });
+        }
+
         Ok(Self {
-            engine: Arc::new(engine),
+            engine,
             module_cache: Mutex::new(HashMap::new()),
+            ticker_stop,
         })
+    }
+}
+
+impl Drop for WasmtimeSandbox {
+    fn drop(&mut self) {
+        self.ticker_stop.store(true, Ordering::Relaxed);
     }
 }
 
@@ -67,7 +134,11 @@ impl SandboxRuntime for WasmtimeSandbox {
             }
         };
 
-        let mut store = Store::new(&self.engine, ());
+        // 023 — store the memory cap in the Store data and install it as the
+        // ResourceLimiter so memory.grow past the cap is rejected.
+        let max_memory_bytes = usize::try_from(limits.max_memory_bytes).unwrap_or(usize::MAX);
+        let mut store = Store::new(&self.engine, StoreLimits { max_memory_bytes });
+        store.limiter(|data| data as &mut dyn ResourceLimiter);
 
         // Fuel-based secondary compute limit.
         let fuel = limits.max_wallclock_ms.saturating_mul(10_000);
@@ -75,13 +146,15 @@ impl SandboxRuntime for WasmtimeSandbox {
             .set_fuel(fuel)
             .map_err(|e| SandboxError::Trap(format!("fuel setup: {}", e)))?;
 
-        // Epoch deadline: trap after 1 epoch increment (finding 013).
-        // set_epoch_deadline(1) = trap when engine epoch reaches current + 1.
-        store.set_epoch_deadline(1);
+        // 024 — wall-clock deadline expressed in ticks of the shared epoch
+        // ticker: ceil(max_wallclock_ms / TICK_MS), at least 1 so a zero/short
+        // budget still traps rather than running unbounded.
+        let deadline_ticks = limits.max_wallclock_ms.div_ceil(TICK_MS).max(1);
+        store.set_epoch_deadline(deadline_ticks);
         store.epoch_deadline_trap();
 
         // No host imports — enforces isolation; a SAFE plugin cannot call the host.
-        let linker: Linker<()> = Linker::new(&self.engine);
+        let linker: Linker<StoreLimits> = Linker::new(&self.engine);
 
         let instance = linker
             .instantiate(&mut store, &compiled)
@@ -110,36 +183,23 @@ impl SandboxRuntime for WasmtimeSandbox {
             .get_typed_func::<(i32, i32), i64>(&mut store, "run")
             .map_err(|e| SandboxError::Trap(format!("module must export 'run': {}", e)))?;
 
-        // 013 — spawn the epoch timer only here, after all fallible setup has
-        // succeeded.  Earlier spawning left a live thread on every early-return
-        // error path; that leaked increment would corrupt the *next* call's
-        // relative epoch deadline.
-        let engine_ref = Arc::clone(&self.engine);
-        let deadline_ms = limits.max_wallclock_ms;
-        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let cancel_clone = Arc::clone(&cancel);
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(deadline_ms));
-            if !cancel_clone.load(std::sync::atomic::Ordering::SeqCst) {
-                engine_ref.increment_epoch();
-            }
-        });
-
+        // 024 — no per-call thread: the shared background epoch ticker drives
+        // the wall-clock deadline set above. The call traps once the epoch has
+        // advanced `deadline_ticks` times.
         let result = run
             .call(&mut store, (0, input_len))
             .map_err(|e| {
-                let msg = e.to_string();
-                if msg.contains("epoch") || msg.contains("interrupt") {
-                    SandboxError::Timeout
-                } else if msg.contains("fuel") || msg.contains("all fuel") {
-                    SandboxError::Timeout
-                } else {
-                    SandboxError::Trap(msg)
+                // Classify resource-exhaustion traps as Timeout. Match on the
+                // structured wasmtime::Trap code rather than the (unstable)
+                // display string: both epoch interruption and fuel exhaustion
+                // mean the budget ran out.
+                match e.downcast_ref::<wasmtime::Trap>() {
+                    Some(wasmtime::Trap::Interrupt) | Some(wasmtime::Trap::OutOfFuel) => {
+                        SandboxError::Timeout
+                    }
+                    _ => SandboxError::Trap(e.to_string()),
                 }
             });
-
-        // Cancel the epoch timer if the call returned before the deadline.
-        cancel.store(true, std::sync::atomic::Ordering::SeqCst);
 
         let packed = result?;
 
@@ -283,5 +343,69 @@ mod tests {
     fn construction_is_fallible() {
         let result = WasmtimeSandbox::new();
         assert!(result.is_ok()); // engine init should succeed on this platform
+    }
+
+    // 023 — a module that grows memory past max_memory_bytes traps.
+    #[test]
+    fn memory_growth_past_limit_traps() {
+        let sb = sandbox();
+        // Module starts at 1 page (64 KiB) and tries to grow by 32 more pages
+        // (2 MiB) in `run`, traps if the grow is denied (memory.grow → -1, then
+        // a store to the un-grown region is out of bounds → trap).
+        let wasm = wat::parse_str(
+            r#"(module
+              (memory (export "memory") 1)
+              (func (export "run") (param i32 i32) (result i64)
+                (drop (memory.grow (i32.const 32)))
+                ;; write at offset 1 MiB — only valid if the grow succeeded
+                (i32.store (i32.const 1048576) (i32.const 1))
+                i64.const 0)
+            )"#,
+        )
+        .unwrap();
+        // Cap memory at 1 page (64 KiB): the 32-page grow must be rejected.
+        let limits = ResourceLimits { max_memory_bytes: 64 * 1024, max_wallclock_ms: 5_000 };
+        let err = sb
+            .execute(SafeModule::new(wasm), vec![], limits)
+            .unwrap_err();
+        assert!(matches!(err, SandboxError::Trap(_)), "got {:?}", err);
+    }
+
+    // 023 — a small module within the cap still runs normally.
+    #[test]
+    fn small_module_runs_within_memory_limit() {
+        let sb = sandbox();
+        let wasm = wat::parse_str(
+            r#"(module
+              (memory (export "memory") 1)
+              (func (export "run") (param i32 i32) (result i64) i64.const 0)
+            )"#,
+        )
+        .unwrap();
+        let limits = ResourceLimits { max_memory_bytes: 16 * 1024 * 1024, max_wallclock_ms: 5_000 };
+        let out = sb.execute(SafeModule::new(wasm), vec![], limits).unwrap();
+        assert!(out.is_empty());
+    }
+
+    // 024 — an infinite-loop module traps on the wall-clock (epoch) deadline.
+    #[test]
+    fn infinite_loop_times_out() {
+        let sb = sandbox();
+        let wasm = wat::parse_str(
+            r#"(module
+              (memory (export "memory") 1)
+              (func (export "run") (param i32 i32) (result i64)
+                (loop $l (br $l))
+                i64.const 0)
+            )"#,
+        )
+        .unwrap();
+        // Short wall-clock budget; the shared ticker advances the epoch and the
+        // loop traps (Timeout). Fuel exhaustion is also mapped to Timeout.
+        let limits = ResourceLimits { max_memory_bytes: 16 * 1024 * 1024, max_wallclock_ms: 50 };
+        let err = sb
+            .execute(SafeModule::new(wasm), vec![], limits)
+            .unwrap_err();
+        assert!(matches!(err, SandboxError::Timeout), "got {:?}", err);
     }
 }

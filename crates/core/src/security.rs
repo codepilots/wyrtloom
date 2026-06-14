@@ -121,7 +121,13 @@ pub enum SecurityError {
 
 pub struct SecurityModule {
     audit_log: Arc<Mutex<Vec<SecurityDecision>>>,
+    /// Root key as supplied/seeded. Retained only so `self_check` can reject an
+    /// all-zero root; all cryptographic use goes through the derived sub-keys.
     hmac_key: [u8; 32],
+    /// Domain-separated sub-key for stamp/session MACs (finding 027).
+    k_session: [u8; 32],
+    /// Domain-separated sub-key for the audit hash-chain (finding 027).
+    k_audit: [u8; 32],
     invalidated: Arc<Mutex<HashSet<Stamp>>>,
     policy: SecurityPolicy,
     /// If Some, every audit entry is appended to this JSONL file.
@@ -151,9 +157,16 @@ impl SecurityModule {
     /// `verify_chain` valid across restarts. The key must not be all-zero
     /// (`self_check` rejects that).
     pub fn with_key(key: [u8; 32], policy: SecurityPolicy) -> Self {
+        // Finding 027: derive two domain-separated sub-keys from the root so the
+        // same secret is never used for two purposes. A single HMAC-extract per
+        // label is a sound KDF here (the root is a uniformly random 32-byte key).
+        let k_session = derive_subkey(&key, b"wyrtloom-session-v1");
+        let k_audit = derive_subkey(&key, b"wyrtloom-audit-v1");
         Self {
             audit_log: Arc::new(Mutex::new(Vec::new())),
             hmac_key: key,
+            k_session,
+            k_audit,
             invalidated: Arc::new(Mutex::new(HashSet::new())),
             policy,
             audit_file: None,
@@ -162,12 +175,53 @@ impl SecurityModule {
     }
 
     /// Enable persistent audit logging to a JSONL file.
+    ///
+    /// Finding 028:
+    /// (a) The file is opened/created with mode 0600 (owner read/write only) so
+    ///     the tamper-evident log is not world-readable; permissions are also
+    ///     defensively re-applied for a pre-existing file.
+    /// (b) If the file already has content, the chain is re-anchored from its
+    ///     LAST line so new entries link onto the old ones across a restart,
+    ///     rather than resetting `prev_hash` to "" and forking the chain.
     pub fn with_audit_file(mut self, path: &str) -> Result<Self, SecurityError> {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
         let f = OpenOptions::new()
             .create(true)
             .append(true)
+            .read(true)
+            .mode(0o600)
             .open(path)
             .map_err(|e| SecurityError::IntegrityFailure(format!("audit file: {}", e)))?;
+
+        // Defensively tighten permissions on a file that already existed (the
+        // `.mode()` above only applies to a freshly-created file).
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| SecurityError::IntegrityFailure(format!("audit file perms: {}", e)))?;
+
+        // Load the existing persisted entries into the in-memory log and
+        // re-anchor the hash chain from the last one, so `verify_chain` covers
+        // the restart boundary and new entries link onto the old ones.
+        let existing = std::fs::read_to_string(path)
+            .map_err(|e| SecurityError::IntegrityFailure(format!("audit file read: {}", e)))?;
+        {
+            let mut log = self.audit_log.lock().unwrap();
+            let mut last = self.last_hash.lock().unwrap();
+            for line in existing.lines() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let entry: SecurityDecision = serde_json::from_str(line).map_err(|e| {
+                    SecurityError::IntegrityFailure(format!("audit file parse: {}", e))
+                })?;
+                // Recompute the chain head from the canonical serialisation of
+                // the just-loaded entry (matching how `audit()` advances it).
+                let serialized = serde_json::to_string(&entry).unwrap_or_default();
+                *last = self.chain_link(serialized.as_bytes());
+                log.push(entry);
+            }
+        }
+
         self.audit_file = Some(Mutex::new(f));
         Ok(self)
     }
@@ -301,19 +355,18 @@ impl SecurityModule {
 
     // ── Private helpers ─────────────────────────────────────────────────────
 
-    /// Keyed chain link: HMAC-SHA256 over a domain tag + the entry serialisation.
+    /// Keyed chain link: HMAC-SHA256 (under the audit sub-key) over a domain tag
+    /// + the entry serialisation.
     fn chain_link(&self, serialized: &[u8]) -> String {
         let mut buf = Vec::with_capacity(serialized.len() + 16);
         buf.extend_from_slice(b"wyrtloom-audit-chain-v1\0");
         buf.extend_from_slice(serialized);
-        hex(&self.compute_mac(&buf))
+        hex(&mac_with(&self.k_audit, &buf))
     }
 
+    /// Stamp/session MAC under the session sub-key (finding 027).
     fn compute_mac(&self, content: &[u8]) -> [u8; 32] {
-        let mut mac = HmacSha256::new_from_slice(&self.hmac_key)
-            .expect("HMAC key is 32 bytes — valid for any HMAC-SHA256 key size");
-        mac.update(content);
-        mac.finalize().into_bytes().into()
+        mac_with(&self.k_session, content)
     }
 
     fn is_allowed(&self, cap: &Capability) -> bool {
@@ -333,7 +386,17 @@ impl SecurityModule {
     }
 
     fn check_file_path(&self, path: &str, prefixes: &[String]) -> bool {
-        !path.contains("..") && prefixes.iter().any(|p| path.starts_with(p.as_str()))
+        if path.contains("..") {
+            return false;
+        }
+        prefixes.iter().any(|p| {
+            // Component-boundary match: a raw `starts_with` lets the prefix
+            // "/etc" grant "/etc-evil/secret". Require either an exact match or a
+            // match up to and including a path separator, mirroring the network
+            // allowlist's dot-separator check.
+            let p = p.trim_end_matches('/');
+            path == p || path.starts_with(&format!("{}/", p))
+        })
     }
 
     fn audit(&self, kind: DecisionKind, detail: String) {
@@ -373,6 +436,22 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
+/// HMAC-SHA256 of `content` under `key`.
+fn mac_with(key: &[u8; 32], content: &[u8]) -> [u8; 32] {
+    let mut mac = HmacSha256::new_from_slice(key)
+        .expect("HMAC key is 32 bytes — valid for any HMAC-SHA256 key size");
+    mac.update(content);
+    mac.finalize().into_bytes().into()
+}
+
+/// Derive a 32-byte domain-separated sub-key from a root key and a label.
+/// This is an HKDF-Extract-style step: `HMAC(root, label)`. Because the root is
+/// a uniformly random 32-byte secret, a single extract per distinct label gives
+/// independent sub-keys suitable for our two domains (session, audit).
+fn derive_subkey(root: &[u8; 32], label: &[u8]) -> [u8; 32] {
+    mac_with(root, label)
+}
+
 /// Bound and de-fang free-text audit detail: cap length and drop control
 /// characters (incl. newlines/escapes) AND Unicode bidi/format codepoints (e.g.
 /// U+202E) so a hostile username/path can neither inject forged-looking lines
@@ -403,6 +482,7 @@ mod tests {
     use super::*;
     use crate::plugin::{Capability, PluginClass, PluginManifest};
     use crate::types::SemVer;
+    use uuid::Uuid;
 
     fn safe_manifest() -> PluginManifest {
         PluginManifest {
@@ -485,6 +565,27 @@ mod tests {
         let mut allow = SecurityPolicy::deny_all();
         allow.allow_shell = true;
         assert!(SecurityModule::with_policy(allow).verify(&m).is_ok());
+    }
+
+    // 026 — prefix match must be at a component boundary: "/etc" must NOT
+    // grant a sibling directory "/etc-evil/…", but MUST grant "/etc/passwd".
+    #[test]
+    fn file_prefix_does_not_grant_sibling_directory() {
+        let mut policy = SecurityPolicy::deny_all();
+        policy.file_read_prefixes = vec!["/etc".into()];
+        let s = SecurityModule::with_policy(policy);
+
+        let mut sibling = unsafe_manifest();
+        sibling.capabilities = vec![Capability::FileRead("/etc-evil/secret".into())];
+        assert!(s.verify(&sibling).is_err(), "sibling dir must be denied");
+
+        let mut inside = unsafe_manifest();
+        inside.capabilities = vec![Capability::FileRead("/etc/passwd".into())];
+        assert!(s.verify(&inside).is_ok(), "child path must be granted");
+
+        let mut exact = unsafe_manifest();
+        exact.capabilities = vec![Capability::FileRead("/etc".into())];
+        assert!(s.verify(&exact).is_ok(), "exact prefix must be granted");
     }
 
     #[test]
@@ -585,6 +686,55 @@ mod tests {
         let content = b"session-payload";
         assert_eq!(a.stamp(content), b.stamp(content));
         assert!(b.is_valid(&a.stamp(content), content));
+    }
+
+    // 028 — reopening an audit file re-anchors the chain: new entries link onto
+    // the old ones and verify_chain passes across the restart boundary.
+    #[test]
+    fn audit_file_chains_across_restart() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("wyrtloom-audit-{}.jsonl", Uuid::new_v4()));
+        let path_str = path.to_str().unwrap();
+        let key = [9u8; 32];
+
+        // First session: write a couple of entries, then drop.
+        {
+            let s = SecurityModule::with_key(key, SecurityPolicy::permissive())
+                .with_audit_file(path_str)
+                .unwrap();
+            s.verify(&safe_manifest()).unwrap();
+            s.verify(&safe_manifest()).unwrap();
+            assert!(s.verify_chain().is_ok());
+
+            // File must be 0600.
+            let mode = std::fs::metadata(path_str).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "audit file must be owner-only");
+        }
+
+        // Second session: reopen with the SAME key, append more entries.
+        {
+            let s = SecurityModule::with_key(key, SecurityPolicy::permissive())
+                .with_audit_file(path_str)
+                .unwrap();
+            // Loaded the prior entries into memory.
+            let before = s.audit_log_snapshot();
+            assert_eq!(before.len(), 2);
+            assert_eq!(before[0].prev_hash, "");
+            assert!(!before[1].prev_hash.is_empty());
+
+            // New entries chain onto the old ones.
+            s.verify(&safe_manifest()).unwrap();
+            let after = s.audit_log_snapshot();
+            assert_eq!(after.len(), 3);
+            assert!(!after[2].prev_hash.is_empty());
+
+            // The whole chain — across the restart boundary — verifies.
+            assert!(s.verify_chain().is_ok());
+        }
+
+        let _ = std::fs::remove_file(path_str);
     }
 
     #[test]
