@@ -1366,6 +1366,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "plugin-mastery-policy"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "wyrtloom-core",
+]
+
+[[package]]
 name = "plugin-provider-ollama"
 version = "0.1.0"
 dependencies = [
