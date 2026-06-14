@@ -1,0 +1,15 @@
+[package]
+name    = "plugin-hunt-harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+wyrtloom-core = { workspace = true }
+serde         = { workspace = true }
+thiserror     = { workspace = true }
+
+[dev-dependencies]
+plugin-sandbox-wasmtime = { path = "../plugin-sandbox-wasmtime" }
+wat                     = { workspace = true }
+uuid                    = { workspace = true }
