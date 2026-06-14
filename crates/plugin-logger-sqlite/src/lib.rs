@@ -115,7 +115,7 @@ impl CallLogger for SqliteCallLogger {
             // 011 — invalid timestamp is an integrity error.
             let at = chrono::DateTime::parse_from_rfc3339(&at_str)
                 .map(|dt| Timestamp(dt.with_timezone(&chrono::Utc)))
-                .map_err(|_| LogError::Storage(format!("integrity error: malformed timestamp")))?;
+                .map_err(|_| LogError::Storage("integrity error: malformed timestamp".to_string()))?;
 
             logs.push(CallLog {
                 task,

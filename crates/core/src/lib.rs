@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod bootstrap;
 pub mod bus;
+pub mod canon;
 pub mod client_auth;
 pub mod escalation;
 pub mod kanban;

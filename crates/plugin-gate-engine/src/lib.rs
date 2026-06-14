@@ -113,23 +113,18 @@ impl GateToken {
         blame: &BlameNotice,
         digest_summary: &str,
     ) -> Vec<u8> {
-        // A length-prefixed, field-tagged encoding avoids ambiguity between,
-        // e.g., actor="a" task ending "b" and actor="ab" — no field boundary
-        // can be shifted without changing the bytes.
-        let mut msg = Vec::new();
-        let mut push = |tag: &str, bytes: &[u8]| {
-            msg.extend_from_slice(tag.as_bytes());
-            msg.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-            msg.extend_from_slice(bytes);
-        };
-        push("task", task.as_bytes());
-        push("from", from.to_string().as_bytes());
-        push("to", to.to_string().as_bytes());
-        push("actor", actor.as_bytes());
-        push("blame_notice", blame.notice.as_bytes());
-        push("blame_template", blame.review_template.as_bytes());
-        push("digest", digest_summary.as_bytes());
-        msg
+        // Shared length-prefixed, field-tagged encoding (core canon primitive):
+        // no field boundary can shift without changing the bytes, and the domain
+        // tag keeps gate tokens distinct from any other signed payload.
+        wyrtloom_core::canon::CanonicalEncoder::new("wyrtloom-gate-v1")
+            .tagged("task", task.as_bytes())
+            .tagged("from", from.to_string().as_bytes())
+            .tagged("to", to.to_string().as_bytes())
+            .tagged("actor", actor.as_bytes())
+            .tagged("blame_notice", blame.notice.as_bytes())
+            .tagged("blame_template", blame.review_template.as_bytes())
+            .tagged("digest", digest_summary.as_bytes())
+            .finish()
     }
 }
 

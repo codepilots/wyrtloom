@@ -9,12 +9,39 @@
 //! never a recoverable secret. The scheme is swappable behind this contract
 //! (mTLS, OAuth client creds, … are alternative implementations).
 
+use crate::canon::CanonicalEncoder;
 use crate::types::Timestamp;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Stable identifier for an enrolled client.
 pub type ClientId = String;
+
+/// Domain-separation tag for the client-auth request canonicalisation.
+pub const CLIENT_AUTH_DOMAIN: &str = "wyrtloom-client-auth-v1";
+
+/// Build the canonical bytes a client signs and the server verifies for a
+/// request. This lives in the contract (not a concrete scheme plugin) so the
+/// client signer, the `ClientAuthScheme` implementation, and the API server all
+/// produce byte-identical input — a signature therefore binds to exactly this
+/// method, path, body, client, time, and nonce, with no field-boundary ambiguity.
+pub fn canonical_request(
+    method: &str,
+    path: &str,
+    body_sha256: &[u8],
+    client_id: &str,
+    timestamp: i64,
+    nonce: &str,
+) -> Vec<u8> {
+    CanonicalEncoder::new(CLIENT_AUTH_DOMAIN)
+        .str_field(method)
+        .str_field(path)
+        .field(body_sha256)
+        .str_field(client_id)
+        .field(&timestamp.to_be_bytes())
+        .str_field(nonce)
+        .finish()
+}
 
 /// First-contact enrollment request, authorised by a bootstrap API key.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,6 +131,17 @@ mod tests {
         let v = serde_json::to_value(&c).unwrap();
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(|s| s.as_str()).collect();
         assert_eq!(keys.len(), 3, "credential should expose exactly id/fingerprint/time, got {keys:?}");
+    }
+
+    #[test]
+    fn canonical_request_is_deterministic_and_binds_fields() {
+        let a = canonical_request("POST", "/api/tasks", b"hash", "client-1", 1_700_000_000, "n1");
+        let b = canonical_request("POST", "/api/tasks", b"hash", "client-1", 1_700_000_000, "n1");
+        assert_eq!(a, b, "same inputs must produce identical bytes");
+        // A different method/path/nonce must change the bytes.
+        assert_ne!(a, canonical_request("GET", "/api/tasks", b"hash", "client-1", 1_700_000_000, "n1"));
+        assert_ne!(a, canonical_request("POST", "/api/task", b"shash", "client-1", 1_700_000_000, "n1"));
+        assert_ne!(a, canonical_request("POST", "/api/tasks", b"hash", "client-1", 1_700_000_000, "n2"));
     }
 
     #[test]
