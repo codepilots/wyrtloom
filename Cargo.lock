@@ -1366,6 +1366,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "plugin-probe-ladder"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror 1.0.69",
+ "wyrtloom-core",
+]
+
+[[package]]
 name = "plugin-provider-ollama"
 version = "0.1.0"
 dependencies = [
