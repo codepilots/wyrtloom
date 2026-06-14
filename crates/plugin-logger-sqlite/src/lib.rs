@@ -5,7 +5,7 @@
 ///   011 – Unknown outcome strings return a Storage error rather than
 ///         silently mapping to Completed.
 use rusqlite::{params, Connection};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use wyrtloom_core::logger::{CallLog, CallLogger, CallOutcome, LogError};
 use wyrtloom_core::storage::validate_db_path;
 use wyrtloom_core::types::Timestamp;
@@ -33,8 +33,18 @@ impl SqliteCallLogger {
         Self::open(":memory:")
     }
 
+    /// Acquire the connection lock, mapping a poisoned mutex to a Storage error
+    /// (finding 030) so one panicking thread cannot DoS the logger.
+    fn lock(&self) -> Result<MutexGuard<'_, Connection>, LogError> {
+        self.conn
+            .lock()
+            .map_err(|_| LogError::Storage("lock poisoned".into()))
+    }
+
     fn init_schema(&self) -> Result<(), rusqlite::Error> {
-        self.conn.lock().unwrap().execute_batch(
+        // A poisoned lock during construction recovers the guard; no other
+        // thread can be mutating the connection at init time.
+        self.conn.lock().unwrap_or_else(|e| e.into_inner()).execute_batch(
             "CREATE TABLE IF NOT EXISTS call_logs (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
                 task_id       TEXT NOT NULL,
@@ -57,7 +67,7 @@ impl SqliteCallLogger {
 
 impl CallLogger for SqliteCallLogger {
     fn all_logs(&self) -> Result<Vec<CallLog>, LogError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock()?;
         let mut stmt = conn
             .prepare(
                 "SELECT task_id, profile, provider, model,
@@ -142,9 +152,7 @@ impl CallLogger for SqliteCallLogger {
             None    => (None, None),
         };
 
-        self.conn
-            .lock()
-            .unwrap()
+        self.lock()?
             .execute(
                 "INSERT INTO call_logs
                  (task_id, profile, provider, model,

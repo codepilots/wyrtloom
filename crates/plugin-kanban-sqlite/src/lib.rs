@@ -9,7 +9,7 @@
 ///   022 – Raw rusqlite error strings are mapped to opaque categories before
 ///         being wrapped in KanbanError::Storage.
 use rusqlite::{params, Connection};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use uuid::Uuid;
 use wyrtloom_core::kanban::{
     BlockReason, is_legal_transition, KanbanBoard, KanbanError, NewTask, StateChange,
@@ -45,7 +45,10 @@ impl SqliteKanbanBoard {
     }
 
     fn init_schema(&self) -> Result<(), rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
+        // A poisoned lock during init surfaces as a corruption-style failure;
+        // `unwrap_or_else` recovers the guard so init can still proceed (no other
+        // thread is mutating the connection during construction).
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS tasks (
                 id           TEXT PRIMARY KEY,
@@ -68,6 +71,14 @@ impl SqliteKanbanBoard {
         )
     }
 
+    /// Acquire the connection lock, mapping a poisoned mutex to a Storage error
+    /// (finding 030) so one panicking thread cannot DoS the whole board.
+    fn lock(&self) -> Result<MutexGuard<'_, Connection>, KanbanError> {
+        self.conn
+            .lock()
+            .map_err(|_| KanbanError::Storage("lock poisoned".into()))
+    }
+
     fn state_from_str(s: &str) -> Option<TaskState> {
         match s {
             "Backlog"  => Some(TaskState::Backlog),
@@ -87,7 +98,7 @@ impl SqliteKanbanBoard {
 impl KanbanBoard for SqliteKanbanBoard {
     fn create(&self, task: NewTask) -> Result<TaskId, KanbanError> {
         let id = Uuid::new_v4();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock()?;
         let depends_json =
             serde_json::to_string(&task.depends_on).map_err(|_| KanbanError::Storage("serialisation failed".into()))?;
         conn.execute(
@@ -115,7 +126,7 @@ impl KanbanBoard for SqliteKanbanBoard {
     ) -> Result<(), KanbanError> {
         // TOCTOU fix (finding 005): wrap read-validate-write in a single
         // BEGIN IMMEDIATE transaction so no other writer can interleave.
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock()?;
         conn.execute("BEGIN IMMEDIATE", [])
             .map_err(|e| KanbanError::Storage(format!("begin tx (code {})", sqlite_code(&e))))?;
 
@@ -129,7 +140,7 @@ impl KanbanBoard for SqliteKanbanBoard {
     }
 
     fn claim(&self, id: TaskId, worker: ActorId) -> Result<(), KanbanError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock()?;
         // Atomic conditional update — already correct in v0.1.
         let rows = conn
             .execute(
@@ -144,12 +155,12 @@ impl KanbanBoard for SqliteKanbanBoard {
     }
 
     fn get(&self, id: TaskId) -> Result<Task, KanbanError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock()?;
         get_inner(&conn, id)
     }
 
     fn list(&self, query: &TaskQuery) -> Result<Vec<Task>, KanbanError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock()?;
         // Gather candidate ids in a stable order, then decode each through the
         // integrity-checked `get_inner` (so malformed rows surface as errors and
         // the decoding logic never drifts from `get`).
@@ -200,7 +211,7 @@ impl KanbanBoard for SqliteKanbanBoard {
         reason: BlockReason,
     ) -> Result<(), KanbanError> {
         // TOCTOU fix (finding 005): transactional read-validate-write.
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock()?;
         conn.execute("BEGIN IMMEDIATE", [])
             .map_err(|e| KanbanError::Storage(format!("begin tx (code {})", sqlite_code(&e))))?;
 
