@@ -1388,6 +1388,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "plugin-withdrawal-scheduler"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "plugin-logger-sqlite",
+ "serde",
+ "thiserror 1.0.69",
+ "uuid",
+ "wyrtloom-core",
+]
+
+[[package]]
 name = "postcard"
 version = "1.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,0 +1,15 @@
+[package]
+name    = "plugin-withdrawal-scheduler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+wyrtloom-core = { workspace = true }
+serde         = { workspace = true }
+chrono        = { workspace = true }
+thiserror     = { workspace = true }
+
+[dev-dependencies]
+plugin-logger-sqlite = { path = "../plugin-logger-sqlite" }
+uuid                 = { workspace = true }
