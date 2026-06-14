@@ -1331,6 +1331,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "plugin-digest-generator"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror 1.0.69",
+ "wyrtloom-core",
+]
+
+[[package]]
 name = "plugin-escalation-cli"
 version = "0.1.0"
 dependencies = [

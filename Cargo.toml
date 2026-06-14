@@ -7,6 +7,7 @@ members = [
     "crates/plugin-logger-sqlite",
     "crates/plugin-escalation-cli",
     "crates/plugin-bus-tokio",
+    "crates/plugin-digest-generator",
     ".",
 ]
 resolver = "2"
