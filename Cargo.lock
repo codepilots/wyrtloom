@@ -1331,6 +1331,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "plugin-calibration-ledger"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "uuid",
+ "wyrtloom-core",
+]
+
+[[package]]
+name = "plugin-coverage-map"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "uuid",
+ "wyrtloom-core",
+]
+
+[[package]]
 name = "plugin-digest-generator"
 version = "0.1.0"
 dependencies = [
@@ -1349,6 +1375,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "plugin-gate-engine"
+version = "0.1.0"
+dependencies = [
+ "plugin-kanban-sqlite",
+ "plugin-logger-sqlite",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "uuid",
+ "wyrtloom-core",
+]
+
+[[package]]
+name = "plugin-hunt-harness"
+version = "0.1.0"
+dependencies = [
+ "plugin-sandbox-wasmtime",
+ "serde",
+ "thiserror 1.0.69",
+ "uuid",
+ "wat",
+ "wyrtloom-core",
+]
+
+[[package]]
 name = "plugin-insight-artifact"
 version = "0.1.0"
 dependencies = [
@@ -1356,6 +1407,16 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "thiserror 1.0.69",
+ "uuid",
+ "wyrtloom-core",
+]
+
+[[package]]
+name = "plugin-interest-router"
+version = "0.1.0"
+dependencies = [
+ "serde",
  "thiserror 1.0.69",
  "uuid",
  "wyrtloom-core",
@@ -1388,6 +1449,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "plugin-mastery-policy"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "wyrtloom-core",
+]
+
+[[package]]
 name = "plugin-probe-ladder"
 version = "0.1.0"
 dependencies = [
@@ -1404,6 +1475,19 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+ "wyrtloom-core",
+]
+
+[[package]]
+name = "plugin-rationale-ledger"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "uuid",
  "wyrtloom-core",
 ]
 
@@ -1426,6 +1510,18 @@ dependencies = [
  "thiserror 1.0.69",
  "wasmtime",
  "wat",
+ "wyrtloom-core",
+]
+
+[[package]]
+name = "plugin-withdrawal-scheduler"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "plugin-logger-sqlite",
+ "serde",
+ "thiserror 1.0.69",
+ "uuid",
  "wyrtloom-core",
 ]
 

@@ -172,7 +172,7 @@ mod tests {
     fn bootstrap_publishes_complete_event() {
         let b = Bootstrapper::new();
         let sys = b.run().unwrap();
-        let mut rx = sys.bus.subscribe("wyrtloom.boot".into());
+        let _rx = sys.bus.subscribe("wyrtloom.boot".into());
         // The event was already sent before we subscribed — in a broadcast channel
         // we won't receive it after the fact, but we can verify the bus is live.
         let _ = sys.bus.publish(Event::new("probe", serde_json::json!({})));
