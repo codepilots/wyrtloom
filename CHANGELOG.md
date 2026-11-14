@@ -2,6 +2,26 @@
 
 ---
 
+## Bounded sandbox module cache (2026-11-14)
+
+Closes the "bounded / evicting module cache" item on the `SECURITY.md` roadmap.
+
+- **`plugin-sandbox-wasmtime` compiled-module cache is now bounded.** It caps both the
+  number of cached modules and their total source WASM bytes, evicting the least
+  recently used; previously every distinct module stayed cached for the life of the
+  sandbox. An evicted module is recompiled if executed again. A module larger than the
+  whole byte budget is run but not cached, and does not flush the cache.
+- **`ModuleCacheLimits { max_modules, max_wasm_bytes }`** (default 64 modules / 64 MiB)
+  and **`WasmtimeSandbox::with_cache_limits`**. `WasmtimeSandbox::new()` keeps its
+  signature and uses the defaults; `max_modules: 0` disables caching.
+
+Known limits: the byte cap counts source WASM, not compiled code, and compilation itself
+is not size- or rate-limited (now the roadmap item).
+
+Tests: 341 across the workspace, all green; no new clippy warnings.
+
+---
+
 ## Hardened bootstrap path (2026-11-14)
 
 Closes the "hardened default bootstrap path" item on the `SECURITY.md` roadmap.

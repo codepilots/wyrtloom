@@ -272,10 +272,13 @@ Treat them as deployment requirements.
   dashboard API does not wire one in yet. Note also that the keyed MAC buys nothing against an in-process
   attacker (who can read `k_audit` from the same process); it matters only for a
   persisted log verified later by a separate trusted process.
-- **Unbounded WASM module cache.** Compiled modules are cached by content hash with
-  no eviction; a stream of *distinct* modules is a memory-growth vector. Fine for a
-  fixed plugin set, risky for arbitrary tenant-supplied modules. Bounded/evicting
-  cache is roadmapped.
+- **WASM module cache is bounded, but compilation is not rate-limited.** Compiled
+  modules are cached by content hash under a cap on module count and total source
+  WASM bytes (default 64 modules / 64 MiB, least-recently-used eviction), so a
+  stream of *distinct* modules no longer grows memory without limit. The byte cap
+  counts source bytes, so compiled code retained is larger than the figure, and
+  each distinct module still costs a compile; hosts accepting tenant-supplied
+  modules should cap module size and rate themselves.
 - **`permissive()` is the v0.1 demo default.** `SecurityPolicy::default()` is
   permissive (grants `/tmp`+`.`, localhost network, git), and `SecurityModule::new()`
   uses it. The bootstrap path does not: `Bootstrapper::run()` boots deny-all, and

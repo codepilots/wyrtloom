@@ -12,6 +12,9 @@
 ///   024 – A single background epoch-ticker thread drives wall-clock timeouts;
 ///         the previous per-call thread both raced under concurrency and was a
 ///         per-execution thread-spawn DoS vector.
+///   030 – The compiled-module cache is bounded (module count and total WASM
+///         bytes) with least-recently-used eviction, so a stream of distinct
+///         modules can no longer grow memory without limit.
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -31,6 +34,104 @@ const TICK_MS: u64 = 1;
 /// caps growth so a no-max table can't be grown unboundedly within a single
 /// call. 10M function-reference slots is far above any legitimate guest need.
 const MAX_TABLE_ELEMS: u32 = 10_000_000;
+
+/// Bounds on the compiled-module cache (finding 030).
+///
+/// Both limits apply; the least-recently-used module is evicted until a new one
+/// fits. Eviction only costs a recompile if that module is executed again.
+///
+/// `max_wasm_bytes` counts the modules' *source* WASM bytes, which is a proxy
+/// for retained memory, not a measurement: compiled code is typically several
+/// times larger than its source. Size the limit with that in mind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModuleCacheLimits {
+    /// Maximum number of cached modules. 0 disables caching.
+    pub max_modules: usize,
+    /// Maximum total source WASM bytes across cached modules. A single module
+    /// larger than this is compiled and run but never cached.
+    pub max_wasm_bytes: usize,
+}
+
+impl Default for ModuleCacheLimits {
+    /// 64 modules / 64 MiB of source WASM: ample for a fixed plugin set.
+    fn default() -> Self {
+        Self { max_modules: 64, max_wasm_bytes: 64 * 1024 * 1024 }
+    }
+}
+
+struct CacheEntry<V> {
+    value: V,
+    size: usize,
+    last_used: u64,
+}
+
+/// A small LRU cache bounded by entry count and total declared size. Generic
+/// over the value so the eviction logic is testable without compiling WASM.
+/// Eviction scans for the oldest entry; the cache is small by construction.
+struct BoundedCache<V> {
+    limits: ModuleCacheLimits,
+    entries: HashMap<[u8; 32], CacheEntry<V>>,
+    total_size: usize,
+    /// Logical clock: bumped on every hit and insert to order entries by use.
+    clock: u64,
+}
+
+impl<V: Clone> BoundedCache<V> {
+    fn new(limits: ModuleCacheLimits) -> Self {
+        Self { limits, entries: HashMap::new(), total_size: 0, clock: 0 }
+    }
+
+    fn get(&mut self, key: &[u8; 32]) -> Option<V> {
+        self.clock += 1;
+        let clock = self.clock;
+        self.entries.get_mut(key).map(|e| {
+            e.last_used = clock;
+            e.value.clone()
+        })
+    }
+
+    /// Insert `value`, evicting least-recently-used entries until it fits. A
+    /// value that can never fit (caching disabled, or larger than the whole
+    /// byte budget) is simply not cached, and evicts nothing.
+    fn insert(&mut self, key: [u8; 32], value: V, size: usize) {
+        if self.limits.max_modules == 0 || size > self.limits.max_wasm_bytes {
+            return;
+        }
+        if let Some(old) = self.entries.remove(&key) {
+            self.total_size -= old.size;
+        }
+        while self.entries.len() >= self.limits.max_modules
+            || self.total_size + size > self.limits.max_wasm_bytes
+        {
+            let oldest = self
+                .entries
+                .iter()
+                .min_by_key(|(_, e)| e.last_used)
+                .map(|(k, _)| *k);
+            match oldest {
+                Some(k) => {
+                    if let Some(e) = self.entries.remove(&k) {
+                        self.total_size -= e.size;
+                    }
+                }
+                None => break,
+            }
+        }
+        self.clock += 1;
+        self.entries.insert(key, CacheEntry { value, size, last_used: self.clock });
+        self.total_size += size;
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg(test)]
+    fn contains(&self, key: &[u8; 32]) -> bool {
+        self.entries.contains_key(key)
+    }
+}
 
 /// Per-store data: enforces the memory cap (finding 023) via `ResourceLimiter`.
 struct StoreLimits {
@@ -66,8 +167,8 @@ impl ResourceLimiter for StoreLimits {
 
 pub struct WasmtimeSandbox {
     engine: Arc<Engine>,
-    /// Cache of compiled modules keyed by SHA-256 of the WASM bytes.
-    module_cache: Mutex<HashMap<[u8; 32], Module>>,
+    /// Bounded LRU cache of compiled modules keyed by SHA-256 of the WASM bytes.
+    module_cache: Mutex<BoundedCache<Module>>,
     /// Set on drop to stop the background epoch ticker thread.
     ticker_stop: Arc<AtomicBool>,
     /// Handle to the background epoch ticker, joined on Drop so the thread and
@@ -76,7 +177,15 @@ pub struct WasmtimeSandbox {
 }
 
 impl WasmtimeSandbox {
+    /// Create a sandbox with the default module-cache bounds
+    /// ([`ModuleCacheLimits::default`]).
     pub fn new() -> Result<Self, SandboxError> {
+        Self::with_cache_limits(ModuleCacheLimits::default())
+    }
+
+    /// Create a sandbox with explicit module-cache bounds. Lower them when
+    /// modules come from untrusted tenants; raise them for a large fixed set.
+    pub fn with_cache_limits(cache_limits: ModuleCacheLimits) -> Result<Self, SandboxError> {
         let mut config = Config::new();
         config.consume_fuel(true);
         // Epoch interruption enables real wall-clock timeouts (finding 013).
@@ -103,7 +212,7 @@ impl WasmtimeSandbox {
 
         Ok(Self {
             engine,
-            module_cache: Mutex::new(HashMap::new()),
+            module_cache: Mutex::new(BoundedCache::new(cache_limits)),
             ticker_stop,
             ticker: Some(ticker),
         })
@@ -145,11 +254,13 @@ impl SandboxRuntime for WasmtimeSandbox {
         let compiled = {
             let mut cache = self.module_cache.lock().unwrap();
             if let Some(m) = cache.get(&module.content_hash) {
-                m.clone()
+                m
             } else {
                 let m = Module::new(&self.engine, &module.wasm_bytes)
                     .map_err(|e| SandboxError::Compile(e.to_string()))?;
-                cache.insert(module.content_hash, m.clone());
+                // 030 — bounded insert: may evict the least-recently-used
+                // modules, or skip caching a module too large for the budget.
+                cache.insert(module.content_hash, m.clone(), module.wasm_bytes.len());
                 m
             }
         };
@@ -355,6 +466,157 @@ mod tests {
             .unwrap();
         }
         assert_eq!(sb.module_cache.lock().unwrap().len(), 1);
+    }
+
+    // ── 030 — bounded module cache ──────────────────────────────────────────
+
+    fn key(n: u8) -> [u8; 32] {
+        [n; 32]
+    }
+
+    fn cache(max_modules: usize, max_wasm_bytes: usize) -> BoundedCache<u32> {
+        BoundedCache::new(ModuleCacheLimits { max_modules, max_wasm_bytes })
+    }
+
+    #[test]
+    fn cache_never_exceeds_module_count() {
+        let mut c = cache(3, usize::MAX);
+        for n in 0..50u8 {
+            c.insert(key(n), n as u32, 10);
+            assert!(c.len() <= 3);
+        }
+        // The three most recent survive.
+        assert!(c.contains(&key(47)) && c.contains(&key(48)) && c.contains(&key(49)));
+        assert_eq!(c.total_size, 30);
+    }
+
+    #[test]
+    fn cache_evicts_least_recently_used_not_oldest_inserted() {
+        let mut c = cache(2, usize::MAX);
+        c.insert(key(1), 1, 10);
+        c.insert(key(2), 2, 10);
+        // Touch 1 so that 2 becomes the least recently used.
+        assert_eq!(c.get(&key(1)), Some(1));
+        c.insert(key(3), 3, 10);
+        assert!(c.contains(&key(1)));
+        assert!(!c.contains(&key(2)));
+        assert!(c.contains(&key(3)));
+    }
+
+    #[test]
+    fn cache_never_exceeds_byte_budget() {
+        let mut c = cache(100, 100);
+        c.insert(key(1), 1, 40);
+        c.insert(key(2), 2, 40);
+        // 60 more would make 140: both older entries must go to fit it.
+        c.insert(key(3), 3, 60);
+        assert!(c.total_size <= 100);
+        assert!(!c.contains(&key(1)));
+        assert!(c.contains(&key(3)));
+        // Size accounting stays exact after evictions.
+        let sum: usize = c.entries.values().map(|e| e.size).sum();
+        assert_eq!(c.total_size, sum);
+    }
+
+    #[test]
+    fn oversized_entry_is_not_cached_and_evicts_nothing() {
+        let mut c = cache(100, 100);
+        c.insert(key(1), 1, 50);
+        c.insert(key(2), 2, 101);
+        assert!(c.contains(&key(1)), "an uncacheable module must not flush the cache");
+        assert!(!c.contains(&key(2)));
+        assert_eq!(c.total_size, 50);
+    }
+
+    #[test]
+    fn zero_capacity_disables_caching() {
+        let mut c = cache(0, usize::MAX);
+        c.insert(key(1), 1, 10);
+        assert_eq!(c.len(), 0);
+        assert_eq!(c.get(&key(1)), None);
+    }
+
+    #[test]
+    fn reinserting_a_key_does_not_double_count_its_size() {
+        let mut c = cache(4, 100);
+        c.insert(key(1), 1, 30);
+        c.insert(key(1), 2, 30);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c.total_size, 30);
+        assert_eq!(c.get(&key(1)), Some(2));
+    }
+
+    /// A distinct, valid module per `n` (the constant changes the bytes).
+    fn distinct_module(n: u32) -> Vec<u8> {
+        wat::parse_str(format!(
+            r#"(module
+              (memory (export "memory") 1)
+              (func (export "unused") (result i32) i32.const {n})
+              (func (export "run") (param i32 i32) (result i64) i64.const 0)
+            )"#
+        ))
+        .unwrap()
+    }
+
+    // The headline: a stream of distinct modules leaves the cache at its cap.
+    #[test]
+    fn stream_of_distinct_modules_keeps_cache_bounded() {
+        let sb = WasmtimeSandbox::with_cache_limits(ModuleCacheLimits {
+            max_modules: 4,
+            max_wasm_bytes: usize::MAX,
+        })
+        .unwrap();
+        for n in 0..20 {
+            sb.execute(SafeModule::new(distinct_module(n)), vec![], ResourceLimits::default())
+                .unwrap();
+            assert!(sb.module_cache.lock().unwrap().len() <= 4);
+        }
+        assert_eq!(sb.module_cache.lock().unwrap().len(), 4);
+    }
+
+    // An evicted module is recompiled on demand and still runs correctly.
+    #[test]
+    fn evicted_module_still_executes() {
+        let sb = WasmtimeSandbox::with_cache_limits(ModuleCacheLimits {
+            max_modules: 1,
+            max_wasm_bytes: usize::MAX,
+        })
+        .unwrap();
+        let first = SafeModule::new(distinct_module(1));
+        let first_hash = first.content_hash;
+        sb.execute(first, vec![], ResourceLimits::default()).unwrap();
+        sb.execute(SafeModule::new(distinct_module(2)), vec![], ResourceLimits::default())
+            .unwrap();
+        assert!(!sb.module_cache.lock().unwrap().contains(&first_hash));
+        sb.execute(SafeModule::new(distinct_module(1)), vec![], ResourceLimits::default())
+            .unwrap();
+        assert!(sb.module_cache.lock().unwrap().contains(&first_hash));
+    }
+
+    #[test]
+    fn caching_disabled_still_executes() {
+        let sb = WasmtimeSandbox::with_cache_limits(ModuleCacheLimits {
+            max_modules: 0,
+            max_wasm_bytes: 0,
+        })
+        .unwrap();
+        for _ in 0..2 {
+            sb.execute(SafeModule::new(distinct_module(7)), vec![], ResourceLimits::default())
+                .unwrap();
+        }
+        assert_eq!(sb.module_cache.lock().unwrap().len(), 0);
+    }
+
+    // A module that fails to compile must not occupy a cache slot.
+    #[test]
+    fn failed_compile_is_not_cached() {
+        let sb = sandbox();
+        let _ = sb.execute(
+            SafeModule::new(b"not wasm at all".to_vec()),
+            vec![],
+            ResourceLimits::default(),
+        );
+        assert_eq!(sb.module_cache.lock().unwrap().len(), 0);
     }
 
     // 019 — Default is not implemented; construction is explicitly fallible
