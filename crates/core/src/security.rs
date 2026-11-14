@@ -9,6 +9,9 @@
 ///         revocation set prevents replay after invalidation.
 ///   009 – Audit entries optionally persisted to a JSONL file; hash-chain
 ///         links each entry to its predecessor for tamper detection.
+///   029 – Optional external high-water-mark anchor (signed entry count +
+///         chain head, stored outside the log) detects suffix truncation.
+use crate::audit_anchor::{AuditAnchorRecord, AuditAnchorStore};
 use crate::plugin::{Capability, PluginClass, PluginManifest};
 use crate::types::Timestamp;
 use hmac::{Hmac, Mac};
@@ -118,6 +121,30 @@ pub enum DecisionKind {
     StampInvalidated,
 }
 
+/// What to do when an anchor store holds no record yet (see
+/// [`SecurityModule::with_audit_anchor`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnchorEnrollment {
+    /// A missing anchor is accepted only for an EMPTY audit log (a fresh
+    /// install). A non-empty log with no anchor is rejected, because that is
+    /// exactly what an attacker who deleted the anchor would present.
+    Strict,
+    /// Accept a missing anchor for a non-empty log and anchor it as it stands.
+    /// For the one-time adoption of anchoring on an existing log only — switch
+    /// back to `Strict` afterwards.
+    EnrollExisting,
+}
+
+/// Running head of the audit chain. Kept under one lock so the entry count and
+/// the head link always describe the same entry.
+#[derive(Default)]
+struct ChainHead {
+    /// Keyed link over the last entry (hex); empty when the chain is empty.
+    hash: String,
+    /// Number of entries in the chain.
+    count: u64,
+}
+
 #[derive(Error, Debug)]
 pub enum SecurityError {
     #[error("integrity check failed: {0}")]
@@ -141,12 +168,18 @@ pub struct SecurityModule {
     k_session: [u8; 32],
     /// Domain-separated sub-key for the audit hash-chain (finding 027).
     k_audit: [u8; 32],
+    /// Domain-separated sub-key for signing the external audit anchor.
+    k_anchor: [u8; 32],
     invalidated: Arc<Mutex<HashSet<Stamp>>>,
     policy: SecurityPolicy,
     /// If Some, every audit entry is appended to this JSONL file.
     audit_file: Option<Mutex<File>>,
-    /// SHA-256 of the last persisted audit entry (hex), for hash-chaining.
-    last_hash: Mutex<String>,
+    /// Head of the audit chain (last link + entry count), for hash-chaining.
+    /// Held across the whole of `audit()` so entries reach the file, the
+    /// in-memory log and the anchor in chain order.
+    chain: Mutex<ChainHead>,
+    /// If Some, the signed high-water mark is kept here (outside the log).
+    anchor: Option<Arc<dyn AuditAnchorStore>>,
 }
 
 impl SecurityModule {
@@ -175,15 +208,18 @@ impl SecurityModule {
         // label is a sound KDF here (the root is a uniformly random 32-byte key).
         let k_session = derive_subkey(&key, b"wyrtloom-session-v1");
         let k_audit = derive_subkey(&key, b"wyrtloom-audit-v1");
+        let k_anchor = derive_subkey(&key, b"wyrtloom-audit-anchor-v1");
         Self {
             audit_log: Arc::new(Mutex::new(Vec::new())),
             hmac_key: key,
             k_session,
             k_audit,
+            k_anchor,
             invalidated: Arc::new(Mutex::new(HashSet::new())),
             policy,
             audit_file: None,
-            last_hash: Mutex::new(String::new()),
+            chain: Mutex::new(ChainHead::default()),
+            anchor: None,
         }
     }
 
@@ -244,7 +280,7 @@ impl SecurityModule {
             .map_err(|_| SecurityError::IntegrityFailure("audit file is not valid UTF-8".into()))?;
         {
             let mut log = self.audit_log.lock().unwrap();
-            let mut last = self.last_hash.lock().unwrap();
+            let mut chain = self.chain.lock().unwrap();
             for line in existing.lines() {
                 if line.trim().is_empty() {
                     continue;
@@ -255,7 +291,8 @@ impl SecurityModule {
                 // Recompute the chain head from the canonical serialisation of
                 // the just-loaded entry (matching how `audit()` advances it).
                 let serialized = serde_json::to_string(&entry).unwrap_or_default();
-                *last = self.chain_link(serialized.as_bytes());
+                chain.hash = self.chain_link(serialized.as_bytes());
+                chain.count += 1;
                 log.push(entry);
             }
         }
@@ -266,6 +303,93 @@ impl SecurityModule {
         self.verify_chain()?;
 
         self.audit_file = Some(Mutex::new(f));
+        Ok(self)
+    }
+
+    /// Anchor the persisted audit chain to an external high-water mark, so that
+    /// **suffix truncation** of the audit file is detected (finding 029).
+    ///
+    /// The anchor is a signed `(entry count, chain head)` record kept in `store`,
+    /// outside the log. This call:
+    /// (a) requires [`with_audit_file`](Self::with_audit_file) to have been called
+    ///     first — an anchor over an in-memory log would report every restart as
+    ///     a truncation;
+    /// (b) loads the record and fails closed (`IntegrityFailure`) if the store
+    ///     errors, the record's MAC does not verify under this module's key, the
+    ///     log holds FEWER entries than the record says (truncation), or the log
+    ///     does not pass through the anchored head (a different chain);
+    /// (c) handles a missing record per `enrollment`;
+    /// (d) writes a fresh record for the log as loaded, then keeps it current
+    ///     after every audit entry.
+    ///
+    /// A log that is AHEAD of its anchor is accepted: the entry is written to the
+    /// file before the anchor advances, so a crash between the two leaves the
+    /// anchor one step behind. The same window means entries written after the
+    /// last successful anchor update are not yet protected.
+    ///
+    /// Limits: the store can replay an older genuine record, and deleting both
+    /// the log and the anchor looks like a fresh install — see
+    /// [`crate::audit_anchor`]. Use a durable key ([`with_key`](Self::with_key));
+    /// with an ephemeral key the record cannot be verified after a restart.
+    pub fn with_audit_anchor(
+        mut self,
+        store: Arc<dyn AuditAnchorStore>,
+        enrollment: AnchorEnrollment,
+    ) -> Result<Self, SecurityError> {
+        if self.audit_file.is_none() {
+            return Err(SecurityError::IntegrityFailure(
+                "audit anchor requires a persisted audit log: call with_audit_file first".into(),
+            ));
+        }
+        {
+            let chain = self.chain.lock().unwrap();
+            let log = self.audit_log.lock().unwrap();
+            let record = store
+                .load()
+                .map_err(|e| SecurityError::IntegrityFailure(e.to_string()))?;
+            match record {
+                None => {
+                    if chain.count > 0 && enrollment == AnchorEnrollment::Strict {
+                        return Err(SecurityError::IntegrityFailure(
+                            "audit anchor missing for a non-empty audit log".into(),
+                        ));
+                    }
+                }
+                Some(rec) => {
+                    if !self.anchor_mac_is_valid(&rec) {
+                        return Err(SecurityError::IntegrityFailure(
+                            "audit anchor signature invalid".into(),
+                        ));
+                    }
+                    if rec.count > chain.count {
+                        return Err(SecurityError::IntegrityFailure(format!(
+                            "audit log truncated: anchor records {} entries, log has {}",
+                            rec.count, chain.count
+                        )));
+                    }
+                    let head_at_anchor = match rec.count {
+                        0 => String::new(),
+                        n => {
+                            let entry = &log[(n - 1) as usize];
+                            let serialized = serde_json::to_string(entry).unwrap_or_default();
+                            self.chain_link(serialized.as_bytes())
+                        }
+                    };
+                    if !constant_time_eq_bytes(head_at_anchor.as_bytes(), rec.head.as_bytes()) {
+                        return Err(SecurityError::IntegrityFailure(
+                            "audit log does not match its anchor (chain head differs)".into(),
+                        ));
+                    }
+                }
+            }
+            // Bring the anchor up to the log as loaded (first enrolment, or a log
+            // that was ahead after a crash). Failing here is fatal: we would
+            // otherwise run believing the log is anchored when it is not.
+            store
+                .store(&self.sign_anchor(chain.count, &chain.hash))
+                .map_err(|e| SecurityError::IntegrityFailure(e.to_string()))?;
+        }
+        self.anchor = Some(store);
         Ok(self)
     }
 
@@ -380,10 +504,9 @@ impl SecurityModule {
     ///   trusted process holding the durable key. For the in-process in-memory
     ///   log, any actor that can mutate the log can also read the key, so the
     ///   keying adds nothing over a plain hash chain there.
-    /// * It does NOT detect *suffix truncation* (dropping the most recent
-    ///   entries) — the shortened chain still verifies. Detecting that requires
-    ///   an external high-water mark (a signed entry count / chain-head),
-    ///   tracked as roadmap (external anchoring).
+    /// * On its own it does NOT detect *suffix truncation* (dropping the most
+    ///   recent entries) — the shortened chain still verifies. That is covered by
+    ///   the external high-water mark: see `with_audit_anchor` / `verify_anchor`.
     ///
     /// Returns an error identifying the first broken link.
     pub fn verify_chain(&self) -> Result<(), SecurityError> {
@@ -401,7 +524,70 @@ impl SecurityModule {
         Ok(())
     }
 
+    /// Whether an external audit anchor is configured.
+    pub fn audit_anchor_configured(&self) -> bool {
+        self.anchor.is_some()
+    }
+
+    /// Check that the external anchor is present, genuinely signed, and exactly
+    /// matches the current chain (entry count and head).
+    ///
+    /// Use it alongside [`verify_chain`](Self::verify_chain) in a health check.
+    /// It fails when no anchor is configured, when the store errors or has lost
+    /// its record, when the record is forged, and when the anchor is stale or
+    /// ahead — a stale anchor means a `store` failed during `audit()`, which
+    /// leaves the newest entries unprotected until the next successful update.
+    pub fn verify_anchor(&self) -> Result<(), SecurityError> {
+        let store = self.anchor.as_ref().ok_or_else(|| {
+            SecurityError::IntegrityFailure("no audit anchor configured".into())
+        })?;
+        // Hold the chain lock so an in-flight `audit()` cannot be observed
+        // between writing its entry and advancing the anchor.
+        let chain = self.chain.lock().unwrap();
+        let rec = store
+            .load()
+            .map_err(|e| SecurityError::IntegrityFailure(e.to_string()))?
+            .ok_or_else(|| SecurityError::IntegrityFailure("audit anchor missing".into()))?;
+        if !self.anchor_mac_is_valid(&rec) {
+            return Err(SecurityError::IntegrityFailure(
+                "audit anchor signature invalid".into(),
+            ));
+        }
+        if rec.count != chain.count
+            || !constant_time_eq_bytes(rec.head.as_bytes(), chain.hash.as_bytes())
+        {
+            return Err(SecurityError::IntegrityFailure(format!(
+                "audit anchor out of step: anchor records {} entries, chain has {}",
+                rec.count, chain.count
+            )));
+        }
+        Ok(())
+    }
+
     // ── Private helpers ─────────────────────────────────────────────────────
+
+    /// MAC binding an anchor's entry count to its chain head, under the anchor
+    /// sub-key: HMAC-SHA256(domain tag || count (u64 BE) || head).
+    fn anchor_mac(&self, count: u64, head: &str) -> [u8; 32] {
+        let mut buf = Vec::with_capacity(head.len() + 40);
+        buf.extend_from_slice(b"wyrtloom-audit-anchor-v1\0");
+        buf.extend_from_slice(&count.to_be_bytes());
+        buf.extend_from_slice(head.as_bytes());
+        mac_with(&self.k_anchor, &buf)
+    }
+
+    fn sign_anchor(&self, count: u64, head: &str) -> AuditAnchorRecord {
+        AuditAnchorRecord {
+            count,
+            head: head.to_string(),
+            mac: hex(&self.anchor_mac(count, head)),
+        }
+    }
+
+    fn anchor_mac_is_valid(&self, rec: &AuditAnchorRecord) -> bool {
+        let expected = hex(&self.anchor_mac(rec.count, &rec.head));
+        constant_time_eq_bytes(expected.as_bytes(), rec.mac.as_bytes())
+    }
 
     /// Keyed chain link: HMAC-SHA256 (under the audit sub-key) over a domain tag
     /// + the entry serialisation.
@@ -448,27 +634,37 @@ impl SecurityModule {
     }
 
     fn audit(&self, kind: DecisionKind, detail: String) {
-        // Hold last_hash across the entire read-compute-write to prevent concurrent
-        // audit() calls from reading the same prev_hash and forking the chain.
-        let entry;
-        let serialized;
-        {
-            let mut last = self.last_hash.lock().unwrap();
-            entry = SecurityDecision {
-                kind, detail, at: Timestamp::now(), prev_hash: last.clone(),
-            };
-            serialized = serde_json::to_string(&entry).unwrap_or_default();
-            *last = self.chain_link(serialized.as_bytes());
-        } // last_hash lock released; I/O and log push happen outside.
+        // Hold the chain lock across the whole read-compute-write. That stops
+        // concurrent audit() calls reading the same prev_hash and forking the
+        // chain, and it keeps the file, the in-memory log and the anchor in
+        // chain order (releasing it before the I/O let two threads write their
+        // lines to the file in the opposite order to their links).
+        let mut chain = self.chain.lock().unwrap();
+        let entry = SecurityDecision {
+            kind, detail, at: Timestamp::now(), prev_hash: chain.hash.clone(),
+        };
+        let serialized = serde_json::to_string(&entry).unwrap_or_default();
+        chain.hash = self.chain_link(serialized.as_bytes());
+        chain.count += 1;
 
         // Optionally persist to file before touching in-memory log.
+        let mut persisted = true;
         if let Some(file_lock) = &self.audit_file {
             let mut f = file_lock.lock().unwrap();
-            let _ = writeln!(f, "{}", serialized);
-            let _ = f.flush();
+            persisted = writeln!(f, "{}", serialized).is_ok() && f.flush().is_ok();
         }
 
         self.audit_log.lock().unwrap().push(entry);
+
+        // Advance the external anchor only AFTER the entry is on disk: a crash
+        // in between leaves the log ahead of the anchor (benign), never behind
+        // it (a false truncation alarm). Best-effort, like the file write — a
+        // failure leaves the anchor stale, which `verify_anchor` reports.
+        if persisted {
+            if let Some(anchor) = &self.anchor {
+                let _ = anchor.store(&self.sign_anchor(chain.count, &chain.hash));
+            }
+        }
     }
 }
 
@@ -529,6 +725,16 @@ fn sanitize_detail(s: &str) -> String {
         .filter(|c| !c.is_control() && !crate::util::is_bidi_or_format(*c))
         .take(MAX)
         .collect()
+}
+
+/// Constant-time equality for two byte strings of public length (no early exit
+/// on content; a length mismatch returns immediately, which leaks nothing here
+/// because the expected length is fixed and public).
+fn constant_time_eq_bytes(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |diff, (x, y)| diff | (x ^ y)) == 0
 }
 
 /// Constant-time equality for two 32-byte MACs (no early exit).
@@ -904,6 +1110,329 @@ mod tests {
         }
 
         let _ = std::fs::remove_file(path_str);
+    }
+
+    // ── 029 — external high-water-mark anchoring ────────────────────────────
+
+    use crate::audit_anchor::{AnchorStoreError, AuditAnchorRecord, AuditAnchorStore};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// In-memory anchor store standing in for "somewhere outside the log".
+    #[derive(Default)]
+    struct MemAnchor {
+        rec: Mutex<Option<AuditAnchorRecord>>,
+        fail_store: AtomicBool,
+        fail_load: AtomicBool,
+    }
+
+    impl AuditAnchorStore for MemAnchor {
+        fn load(&self) -> Result<Option<AuditAnchorRecord>, AnchorStoreError> {
+            if self.fail_load.load(Ordering::SeqCst) {
+                return Err(AnchorStoreError("down".into()));
+            }
+            Ok(self.rec.lock().unwrap().clone())
+        }
+        fn store(&self, record: &AuditAnchorRecord) -> Result<(), AnchorStoreError> {
+            if self.fail_store.load(Ordering::SeqCst) {
+                return Err(AnchorStoreError("down".into()));
+            }
+            *self.rec.lock().unwrap() = Some(record.clone());
+            Ok(())
+        }
+    }
+
+    struct TempAudit(std::path::PathBuf);
+    impl TempAudit {
+        fn new(tag: &str) -> Self {
+            Self(std::env::temp_dir().join(format!("wyrtloom-anchor-{tag}-{}.jsonl", Uuid::new_v4())))
+        }
+        fn path(&self) -> &str {
+            self.0.to_str().unwrap()
+        }
+        /// Keep only the first `n` lines of the audit file.
+        fn truncate_to(&self, n: usize) {
+            let contents = std::fs::read_to_string(&self.0).unwrap();
+            let kept: Vec<&str> = contents.lines().take(n).collect();
+            let mut out = kept.join("\n");
+            if n > 0 {
+                out.push('\n');
+            }
+            std::fs::write(&self.0, out).unwrap();
+        }
+    }
+    impl Drop for TempAudit {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    const ANCHOR_KEY: [u8; 32] = [13u8; 32];
+
+    fn open_anchored(
+        file: &TempAudit,
+        anchor: &Arc<MemAnchor>,
+        enrollment: AnchorEnrollment,
+    ) -> Result<SecurityModule, SecurityError> {
+        SecurityModule::with_key(ANCHOR_KEY, SecurityPolicy::permissive())
+            .with_audit_file(file.path())?
+            .with_audit_anchor(anchor.clone(), enrollment)
+    }
+
+    /// Write `n` entries through an anchored module, then drop it.
+    fn write_entries(file: &TempAudit, anchor: &Arc<MemAnchor>, n: usize) {
+        let s = open_anchored(file, anchor, AnchorEnrollment::Strict).unwrap();
+        for _ in 0..n {
+            s.verify(&safe_manifest()).unwrap();
+        }
+    }
+
+    fn expect_integrity_failure(r: Result<SecurityModule, SecurityError>, needle: &str) {
+        match r {
+            Err(SecurityError::IntegrityFailure(msg)) => {
+                assert!(msg.contains(needle), "expected {needle:?} in {msg:?}")
+            }
+            Err(other) => panic!("expected IntegrityFailure, got {other:?}"),
+            Ok(_) => panic!("expected IntegrityFailure containing {needle:?}, got Ok"),
+        }
+    }
+
+    #[test]
+    fn anchor_tracks_every_audit_entry() {
+        let file = TempAudit::new("track");
+        let anchor = Arc::new(MemAnchor::default());
+        let s = open_anchored(&file, &anchor, AnchorEnrollment::Strict).unwrap();
+        // A fresh install is anchored at zero straight away.
+        assert_eq!(anchor.rec.lock().unwrap().as_ref().unwrap().count, 0);
+        assert!(s.verify_anchor().is_ok());
+
+        s.verify(&safe_manifest()).unwrap();
+        s.verify(&safe_manifest()).unwrap();
+        let rec = anchor.rec.lock().unwrap().clone().unwrap();
+        assert_eq!(rec.count, 2);
+        assert!(!rec.head.is_empty());
+        assert!(s.verify_anchor().is_ok());
+        assert!(s.audit_anchor_configured());
+    }
+
+    #[test]
+    fn anchored_log_reopens_cleanly() {
+        let file = TempAudit::new("reopen");
+        let anchor = Arc::new(MemAnchor::default());
+        write_entries(&file, &anchor, 3);
+        let s = open_anchored(&file, &anchor, AnchorEnrollment::Strict).unwrap();
+        assert_eq!(s.audit_log_snapshot().len(), 3);
+        s.verify(&safe_manifest()).unwrap();
+        assert_eq!(anchor.rec.lock().unwrap().as_ref().unwrap().count, 4);
+        assert!(s.verify_chain().is_ok());
+        assert!(s.verify_anchor().is_ok());
+    }
+
+    // The headline: dropping the newest entries leaves a chain that still
+    // verifies on its own, and the anchor is what catches it.
+    #[test]
+    fn suffix_truncation_is_detected_on_open() {
+        let file = TempAudit::new("trunc");
+        let anchor = Arc::new(MemAnchor::default());
+        write_entries(&file, &anchor, 3);
+        file.truncate_to(2);
+
+        // Without the anchor the shortened log is accepted...
+        let unanchored = SecurityModule::with_key(ANCHOR_KEY, SecurityPolicy::permissive())
+            .with_audit_file(file.path())
+            .unwrap();
+        assert!(unanchored.verify_chain().is_ok());
+        drop(unanchored);
+
+        // ...with it, the open fails closed.
+        expect_integrity_failure(
+            open_anchored(&file, &anchor, AnchorEnrollment::Strict),
+            "truncated",
+        );
+        // Enrolment mode must not be a way round an EXISTING anchor.
+        expect_integrity_failure(
+            open_anchored(&file, &anchor, AnchorEnrollment::EnrollExisting),
+            "truncated",
+        );
+        // A rejected open must not have moved the anchor.
+        assert_eq!(anchor.rec.lock().unwrap().as_ref().unwrap().count, 3);
+    }
+
+    #[test]
+    fn truncation_to_empty_is_detected() {
+        let file = TempAudit::new("empty");
+        let anchor = Arc::new(MemAnchor::default());
+        write_entries(&file, &anchor, 2);
+        file.truncate_to(0);
+        expect_integrity_failure(
+            open_anchored(&file, &anchor, AnchorEnrollment::Strict),
+            "truncated",
+        );
+    }
+
+    #[test]
+    fn log_ahead_of_anchor_is_accepted_and_anchor_catches_up() {
+        let file = TempAudit::new("ahead");
+        let anchor = Arc::new(MemAnchor::default());
+        write_entries(&file, &anchor, 2);
+        let behind = anchor.rec.lock().unwrap().clone();
+        write_entries(&file, &anchor, 1);
+        // Simulate a crash after the log line was written but before the anchor
+        // advanced: the anchor is one entry behind.
+        *anchor.rec.lock().unwrap() = behind;
+
+        let s = open_anchored(&file, &anchor, AnchorEnrollment::Strict).unwrap();
+        assert_eq!(anchor.rec.lock().unwrap().as_ref().unwrap().count, 3);
+        assert!(s.verify_anchor().is_ok());
+    }
+
+    #[test]
+    fn forged_anchor_is_rejected() {
+        let file = TempAudit::new("forged");
+        let anchor = Arc::new(MemAnchor::default());
+        write_entries(&file, &anchor, 3);
+        file.truncate_to(1);
+        // Attacker lowers the count to match the truncated log but cannot re-sign.
+        anchor.rec.lock().unwrap().as_mut().unwrap().count = 1;
+        expect_integrity_failure(
+            open_anchored(&file, &anchor, AnchorEnrollment::Strict),
+            "signature",
+        );
+    }
+
+    #[test]
+    fn anchor_signed_under_another_key_is_rejected() {
+        let file = TempAudit::new("otherkey");
+        let anchor = Arc::new(MemAnchor::default());
+        write_entries(&file, &anchor, 1);
+        // A record genuinely signed, but by a module holding a different key.
+        let other = SecurityModule::with_key([99u8; 32], SecurityPolicy::permissive());
+        let rec = anchor.rec.lock().unwrap().clone().unwrap();
+        *anchor.rec.lock().unwrap() = Some(other.sign_anchor(rec.count, &rec.head));
+        expect_integrity_failure(
+            open_anchored(&file, &anchor, AnchorEnrollment::Strict),
+            "signature",
+        );
+    }
+
+    #[test]
+    fn anchor_for_a_different_chain_is_rejected() {
+        let file = TempAudit::new("otherchain");
+        let anchor = Arc::new(MemAnchor::default());
+        write_entries(&file, &anchor, 2);
+        // A correctly signed record whose head is not this log's head at count 2.
+        let s = SecurityModule::with_key(ANCHOR_KEY, SecurityPolicy::permissive());
+        *anchor.rec.lock().unwrap() = Some(s.sign_anchor(2, &"0".repeat(64)));
+        expect_integrity_failure(
+            open_anchored(&file, &anchor, AnchorEnrollment::Strict),
+            "chain head differs",
+        );
+    }
+
+    #[test]
+    fn missing_anchor_for_existing_log_needs_explicit_enrolment() {
+        let file = TempAudit::new("enrol");
+        // An existing, un-anchored log.
+        {
+            let s = SecurityModule::with_key(ANCHOR_KEY, SecurityPolicy::permissive())
+                .with_audit_file(file.path())
+                .unwrap();
+            s.verify(&safe_manifest()).unwrap();
+            s.verify(&safe_manifest()).unwrap();
+        }
+        let anchor = Arc::new(MemAnchor::default());
+        // Strict: a non-empty log with no anchor looks like a deleted anchor.
+        expect_integrity_failure(
+            open_anchored(&file, &anchor, AnchorEnrollment::Strict),
+            "anchor missing",
+        );
+        assert!(anchor.rec.lock().unwrap().is_none());
+        // Explicit one-time adoption anchors the log as it stands.
+        let s = open_anchored(&file, &anchor, AnchorEnrollment::EnrollExisting).unwrap();
+        assert_eq!(anchor.rec.lock().unwrap().as_ref().unwrap().count, 2);
+        drop(s);
+        // From then on Strict works.
+        assert!(open_anchored(&file, &anchor, AnchorEnrollment::Strict).is_ok());
+    }
+
+    #[test]
+    fn anchor_requires_a_persisted_audit_file() {
+        let anchor = Arc::new(MemAnchor::default());
+        let r = SecurityModule::with_key(ANCHOR_KEY, SecurityPolicy::permissive())
+            .with_audit_anchor(anchor, AnchorEnrollment::Strict);
+        expect_integrity_failure(r, "with_audit_file first");
+    }
+
+    #[test]
+    fn anchor_store_failure_at_open_fails_closed() {
+        let file = TempAudit::new("storefail");
+        let anchor = Arc::new(MemAnchor::default());
+        anchor.fail_load.store(true, Ordering::SeqCst);
+        expect_integrity_failure(
+            open_anchored(&file, &anchor, AnchorEnrollment::Strict),
+            "anchor store failure",
+        );
+        anchor.fail_load.store(false, Ordering::SeqCst);
+        anchor.fail_store.store(true, Ordering::SeqCst);
+        expect_integrity_failure(
+            open_anchored(&file, &anchor, AnchorEnrollment::Strict),
+            "anchor store failure",
+        );
+    }
+
+    #[test]
+    fn verify_anchor_reports_stale_missing_and_unconfigured() {
+        // Unconfigured.
+        assert!(sec().verify_anchor().is_err());
+        assert!(!sec().audit_anchor_configured());
+
+        let file = TempAudit::new("stale");
+        let anchor = Arc::new(MemAnchor::default());
+        let s = open_anchored(&file, &anchor, AnchorEnrollment::Strict).unwrap();
+        s.verify(&safe_manifest()).unwrap();
+        assert!(s.verify_anchor().is_ok());
+
+        // The store goes down: auditing carries on, but the anchor is now stale.
+        anchor.fail_store.store(true, Ordering::SeqCst);
+        s.verify(&safe_manifest()).unwrap();
+        assert_eq!(s.audit_log_snapshot().len(), 2);
+        assert!(s.verify_anchor().is_err());
+
+        // It recovers on the next successful update.
+        anchor.fail_store.store(false, Ordering::SeqCst);
+        s.verify(&safe_manifest()).unwrap();
+        assert!(s.verify_anchor().is_ok());
+
+        // The record vanishing from the store is reported too.
+        *anchor.rec.lock().unwrap() = None;
+        assert!(s.verify_anchor().is_err());
+    }
+
+    // Entries must reach the file in chain order even under contention, or the
+    // persisted chain (and so the anchor) would not verify on the next open.
+    #[test]
+    fn concurrent_audits_keep_file_and_anchor_in_chain_order() {
+        let file = TempAudit::new("concurrent");
+        let anchor = Arc::new(MemAnchor::default());
+        let s = Arc::new(open_anchored(&file, &anchor, AnchorEnrollment::Strict).unwrap());
+        let handles: Vec<_> = (0..8)
+            .map(|t| {
+                let s = s.clone();
+                std::thread::spawn(move || {
+                    for i in 0..50 {
+                        s.record_decision(true, format!("thread {t} entry {i}"));
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert!(s.verify_chain().is_ok());
+        assert!(s.verify_anchor().is_ok());
+        assert_eq!(anchor.rec.lock().unwrap().as_ref().unwrap().count, 400);
+        drop(s);
+        let reopened = open_anchored(&file, &anchor, AnchorEnrollment::Strict).unwrap();
+        assert_eq!(reopened.audit_log_snapshot().len(), 400);
     }
 
     #[test]
