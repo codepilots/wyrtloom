@@ -17,6 +17,7 @@ impl Default for ResourceLimits {
 /// Opaque handle to a compiled safe WASM module.
 /// The `content_hash` is the SHA-256 of `wasm_bytes`, computed once at
 /// construction so the sandbox can key its module cache without re-hashing.
+#[derive(Debug, Clone)]
 pub struct SafeModule {
     pub wasm_bytes: Bytes,
     pub content_hash: [u8; 32],
@@ -31,12 +32,43 @@ impl SafeModule {
     }
 }
 
+/// Limits on sandbox *compilation*, complementing [`ModuleCacheLimits`] (in the
+/// wasmtime plugin). The cache bounds retained memory, but compilation itself
+/// is the CPU-DoS surface: a single very large module is still compiled on
+/// demand, and a rapid stream of distinct modules forces repeated Cranelift
+/// compiles. These two limits gate compilation up-front.
+///
+/// - `max_module_bytes` — a module whose source WASM bytes exceed this is
+///   refused *before* Cranelift runs, never merely "run but not cached".
+/// - `max_compiles_per_window` — at most this many fresh compilations are
+///   admitted per `window_secs`; cache hits are free. A burst beyond the
+///   budget is refused (rate-limited) rather than burning CPU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompileLimits {
+    pub max_module_bytes: usize,
+    pub max_compiles_per_window: usize,
+    pub window_secs: u64,
+}
+
+impl Default for CompileLimits {
+    /// 16 MiB source WASM per module (well above any legit SAFE plugin), and
+    /// 32 fresh compiles per 10 s — ample for a fixed plugin set, and a hard
+    /// brake on a hostile stream of distinct modules.
+    fn default() -> Self {
+        Self { max_module_bytes: 16 * 1024 * 1024, max_compiles_per_window: 32, window_secs: 10 }
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum SandboxError {
     #[error("memory limit exceeded")]
     MemoryExceeded,
     #[error("execution timed out")]
     Timeout,
+    #[error("module too large: {0} bytes exceeds per-module limit of {1}")]
+    ModuleTooLarge(usize, usize),
+    #[error("compile rate limit exceeded")]
+    CompileRateExceeded,
     #[error("sandboxed code attempted to access host capability: {0:?}")]
     HostAccessAttempted(Capability),
     #[error("wasm trap: {0}")]
@@ -66,6 +98,14 @@ mod tests {
         let lim = ResourceLimits::default();
         assert!(lim.max_memory_bytes > 0);
         assert!(lim.max_wallclock_ms > 0);
+    }
+
+    #[test]
+    fn compile_limits_have_sensible_defaults() {
+        let lim = CompileLimits::default();
+        assert!(lim.max_module_bytes > 0);
+        assert!(lim.max_compiles_per_window > 0);
+        assert!(lim.window_secs > 0);
     }
 
     #[test]

@@ -150,6 +150,12 @@ persists state through storage plugins. The security boundaries we defend:
   modules / 64 MiB), evicting the least recently used. A module larger than the
   whole byte budget is run but not cached. Tune with
   `WasmtimeSandbox::with_cache_limits`.
+- **Compilation gated up-front** (finding 031): a module over
+  `CompileLimits.max_module_bytes` (default 16 MiB) is refused *before* Cranelift
+  with `SandboxError::ModuleTooLarge`, and a `CompileRateLimiter` caps fresh
+  compiles at `max_compiles_per_window` per `window_secs` (default 32 per 10 s),
+  returning `SandboxError::CompileRateExceeded` on burst. Cache hits are free.
+  Construct with `WasmtimeSandbox::with_limits(cache, compile)`.
 
 ### 4. Storage plugins (`plugin-kanban-sqlite`, `plugin-logger-sqlite`)
 
@@ -309,9 +315,10 @@ persists state through storage plugins. The security boundaries we defend:
 - **Binary measurement / platform attestation** in `self_check` — reserved for
   Phase 3 (`security.rs` lines 4-5, 234-235). v0.1 validates only key entropy and
   data-structure accessibility.
-- **Per-module size and compile-rate limits** in the sandbox. The module cache is
-  now bounded, but a single very large module, or a rapid stream of distinct
-  ones, is still compiled on demand.
+- **Per-module size and compile-rate limits** — DONE (finding 031, Nov 2026):
+  `CompileLimits` refuses a module over `max_module_bytes` before compilation
+  (`ModuleTooLarge`) and rate-limits fresh compiles per window
+  (`CompileRateExceeded`); see the "Compilation gated up-front" control above.
 - **`SecurityPolicy::default()` is still permissive.** The bootstrap path is
   hardened (`run()` is deny-all, `run_with` takes an explicit module), but the
   type's `Default` and `SecurityModule::new()` remain permissive for existing

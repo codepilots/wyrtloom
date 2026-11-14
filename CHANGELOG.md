@@ -2,6 +2,26 @@
 
 ---
 
+## Per-module compile limits (2026-11-14)
+
+Closes roadmap item 3 ("per-module size and compile-rate limits in the sandbox").
+
+- **`plugin-sandbox-wasmtime` gates compilation up-front (finding 031).** The
+  compiled-module cache was bounded (above), but a single very large module still
+  compiled on demand, and a rapid stream of distinct modules forced repeated
+  Cranelift compiles — both CPU-DoS paths.
+- **`CompileLimits { max_module_bytes, max_compiles_per_window, window_secs }`**
+  (default 16 MiB / 32 per 10 s). `WasmtimeSandbox::with_limits(cache, compile)` is
+  the new constructor; `new()` and `with_cache_limits()` keep their signatures and
+  use default compile limits.
+- **`execute` refuses** a module over the byte cap with `SandboxError::ModuleTooLarge`
+  **before** Cranelift runs, and a `CompileRateLimiter` admits at most
+  `max_compiles_per_window` fresh compiles per `window_secs`, returning
+  `SandboxError::CompileRateExceeded` on burst. Cache hits are never counted.
+- `SafeModule` now derives `Clone` (needed to re-run a cached module by value).
+
+Tests: 347 across the workspace, all green; no new clippy warnings (6 new tests).
+
 ## Bounded sandbox module cache (2026-11-14)
 
 Closes the "bounded / evicting module cache" item on the `SECURITY.md` roadmap.
@@ -15,8 +35,8 @@ Closes the "bounded / evicting module cache" item on the `SECURITY.md` roadmap.
   and **`WasmtimeSandbox::with_cache_limits`**. `WasmtimeSandbox::new()` keeps its
   signature and uses the defaults; `max_modules: 0` disables caching.
 
-Known limits: the byte cap counts source WASM, not compiled code, and compilation itself
-is not size- or rate-limited (now the roadmap item).
+Known limits: the byte cap counts source WASM, not compiled code. Compilation is
+now gated by per-module size and rate limits (the next changelog section above).
 
 Tests: 341 across the workspace, all green; no new clippy warnings.
 

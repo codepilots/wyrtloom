@@ -15,13 +15,13 @@
 ///   030 – The compiled-module cache is bounded (module count and total WASM
 ///         bytes) with least-recently-used eviction, so a stream of distinct
 ///         modules can no longer grow memory without limit.
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use wasmtime::{Config, Engine, Linker, Module, ResourceLimiter, Store};
-use wyrtloom_core::sandbox::{ResourceLimits, SafeModule, SandboxError, SandboxRuntime};
+use wyrtloom_core::sandbox::{CompileLimits, ResourceLimits, SafeModule, SandboxError, SandboxRuntime};
 use wyrtloom_core::types::Bytes;
 
 /// Cadence of the background epoch ticker. Per-call deadlines are expressed as a
@@ -165,10 +165,62 @@ impl ResourceLimiter for StoreLimits {
     }
 }
 
+/// Compile-rate limiting (roadmap item: a rapid stream of *distinct* modules
+/// forces repeated Cranelift compilation — a CPU-DoS. Cache hits are free and
+/// never counted; this budgets only fresh compiles).
+struct CompileRateLimiter {
+    window_secs: u64,
+    max_per_window: usize,
+    /// Timestamps (Instant::now) of admitted compiles within the current
+    /// window. Evicted as they age out; bounded by `max_per_window`.
+    admits: VecDeque<Instant>,
+}
+
+impl CompileRateLimiter {
+    fn new(limits: CompileLimits) -> Self {
+        Self {
+            window_secs: limits.window_secs,
+            max_per_window: limits.max_compiles_per_window,
+            admits: VecDeque::new(),
+        }
+    }
+
+    /// Attempt to admit one fresh compile. Returns Ok(()) if within budget;
+    /// Err(CompileRateExceeded) otherwise. Never counts a cache hit.
+    fn try_admit(&mut self, now: Instant) -> Result<(), SandboxError> {
+        if self.max_per_window == 0 {
+            return Err(SandboxError::CompileRateExceeded);
+        }
+        let window = Duration::from_secs(self.window_secs);
+        // Drop any admits that fell out of the window.
+        while let Some(&first) = self.admits.front() {
+            if now.duration_since(first) >= window {
+                self.admits.pop_front();
+            } else {
+                break;
+            }
+        }
+        if self.admits.len() >= self.max_per_window {
+            return Err(SandboxError::CompileRateExceeded);
+        }
+        self.admits.push_back(now);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.admits.len()
+    }
+}
+
 pub struct WasmtimeSandbox {
     engine: Arc<Engine>,
     /// Bounded LRU cache of compiled modules keyed by SHA-256 of the WASM bytes.
     module_cache: Mutex<BoundedCache<Module>>,
+    /// Per-module compile-size cap + fresh-compile rate limit.
+    compile_limits: CompileLimits,
+    /// Fresh-compile admission budget (mirrors `compile_limits`).
+    compile_limiter: Mutex<CompileRateLimiter>,
     /// Set on drop to stop the background epoch ticker thread.
     ticker_stop: Arc<AtomicBool>,
     /// Handle to the background epoch ticker, joined on Drop so the thread and
@@ -177,15 +229,24 @@ pub struct WasmtimeSandbox {
 }
 
 impl WasmtimeSandbox {
-    /// Create a sandbox with the default module-cache bounds
-    /// ([`ModuleCacheLimits::default`]).
+    /// Create a sandbox with the default module-cache and compile limits
+    /// ([`ModuleCacheLimits::default`], [`CompileLimits::default`]).
     pub fn new() -> Result<Self, SandboxError> {
-        Self::with_cache_limits(ModuleCacheLimits::default())
+        Self::with_limits(ModuleCacheLimits::default(), CompileLimits::default())
     }
 
-    /// Create a sandbox with explicit module-cache bounds. Lower them when
-    /// modules come from untrusted tenants; raise them for a large fixed set.
+    /// Create a sandbox with explicit module-cache bounds. Compile limits use
+    /// their defaults. Lower cache limits when modules come from untrusted
+    /// tenants; raise them for a large fixed set.
     pub fn with_cache_limits(cache_limits: ModuleCacheLimits) -> Result<Self, SandboxError> {
+        Self::with_limits(cache_limits, CompileLimits::default())
+    }
+
+    /// Create a sandbox with explicit module-cache and compile limits.
+    pub fn with_limits(
+        cache_limits: ModuleCacheLimits,
+        compile_limits: CompileLimits,
+    ) -> Result<Self, SandboxError> {
         let mut config = Config::new();
         config.consume_fuel(true);
         // Epoch interruption enables real wall-clock timeouts (finding 013).
@@ -213,6 +274,8 @@ impl WasmtimeSandbox {
         Ok(Self {
             engine,
             module_cache: Mutex::new(BoundedCache::new(cache_limits)),
+            compile_limits,
+            compile_limiter: Mutex::new(CompileRateLimiter::new(compile_limits)),
             ticker_stop,
             ticker: Some(ticker),
         })
@@ -253,16 +316,38 @@ impl SandboxRuntime for WasmtimeSandbox {
         // SafeModule::new(), avoiding a full SHA-256 on every cache-hit call.
         let compiled = {
             let mut cache = self.module_cache.lock().unwrap();
-            if let Some(m) = cache.get(&module.content_hash) {
+            let m = if let Some(m) = cache.get(&module.content_hash) {
                 m
             } else {
+                // Per-module compile-size gate (roadmap: a single very large
+                // module must be refused BEFORE Cranelift burns CPU/memory —
+                // merely "run but not cached" still compiles it).
+                if module.wasm_bytes.len() > self.compile_limits.max_module_bytes {
+                    return Err(SandboxError::ModuleTooLarge(
+                        module.wasm_bytes.len(),
+                        self.compile_limits.max_module_bytes,
+                    ));
+                }
+                // Fresh-compile rate limit (roadmap: a rapid stream of distinct
+                // modules forces repeated compiles — a CPU-DoS). Cache hits are
+                // free; only a genuine compile is admitted and counted.
+                {
+                    let now = Instant::now();
+                    let mut limiter = self.compile_limiter.lock().unwrap();
+                    limiter.try_admit(now)?;
+                }
                 let m = Module::new(&self.engine, &module.wasm_bytes)
                     .map_err(|e| SandboxError::Compile(e.to_string()))?;
+                drop(cache);
                 // 030 — bounded insert: may evict the least-recently-used
                 // modules, or skip caching a module too large for the budget.
-                cache.insert(module.content_hash, m.clone(), module.wasm_bytes.len());
+                self.module_cache
+                    .lock()
+                    .unwrap()
+                    .insert(module.content_hash, m.clone(), module.wasm_bytes.len());
                 m
-            }
+            };
+            m
         };
 
         // 023 — store the memory cap in the Store data and install it as the
@@ -689,5 +774,108 @@ mod tests {
             .execute(SafeModule::new(wasm), vec![], limits)
             .unwrap_err();
         assert!(matches!(err, SandboxError::Timeout), "got {:?}", err);
+    }
+
+    // ── Per-module compile-size gate (roadmap #3) ──────────────────────────
+
+    #[test]
+    fn oversized_module_is_refused_before_compile() {
+        // A module bigger than the per-module cap must be rejected even though
+        // it is a valid, executable module: "run but not cached" would still
+        // compile it and burn CPU (the failing behaviour we are closing).
+        let sb = WasmtimeSandbox::with_limits(
+            ModuleCacheLimits::default(),
+            CompileLimits { max_module_bytes: 32, max_compiles_per_window: 4, window_secs: 10 },
+        )
+        .unwrap();
+        // Real, runnable module — larger than the 32-byte cap.
+        let wasm = wat::parse_str(
+            r#"(module
+              (memory (export "memory") 1)
+              (func (export "run") (param i32 i32) (result i64) i64.const 0)
+            )"#,
+        )
+        .unwrap();
+        let err = sb
+            .execute(SafeModule::new(wasm), vec![], ResourceLimits::default())
+            .unwrap_err();
+        match err {
+            SandboxError::ModuleTooLarge(len, cap) => {
+                assert!(len > cap, "wasm was unexpectedly under the cap");
+            }
+            other => panic!("expected ModuleTooLarge, got {other:?}"),
+        }
+    }
+
+    // ── Fresh-compile rate limit (roadmap #3) ──────────────────────────────
+
+    #[test]
+    fn distinct_stream_hits_compile_rate_limit() {
+        // Tight budget: 2 compiles per 1 s. Cache hits are free, so repeating a
+        // module beyond the budget must still succeed, while a 3rd distinct
+        // module (a fresh compile) is refused.
+        let sb = WasmtimeSandbox::with_limits(
+            ModuleCacheLimits::default(),
+            CompileLimits { max_module_bytes: 1 << 20, max_compiles_per_window: 2, window_secs: 1 },
+        )
+        .unwrap();
+        // Two distinct modules compile fine.
+        for n in 0..2u32 {
+            sb.execute(
+                SafeModule::new(distinct_module(n)),
+                vec![],
+                ResourceLimits::default(),
+            )
+            .unwrap();
+        }
+        // A third distinct module exceeds the budget and is refused.
+        let err = sb
+            .execute(SafeModule::new(distinct_module(7)), vec![], ResourceLimits::default())
+            .unwrap_err();
+        assert!(matches!(err, SandboxError::CompileRateExceeded));
+    }
+
+    #[test]
+    fn cache_hits_do_not_count_against_compile_budget() {
+        let sb = WasmtimeSandbox::with_limits(
+            ModuleCacheLimits::default(),
+            CompileLimits { max_module_bytes: 1 << 20, max_compiles_per_window: 1, window_secs: 60 },
+        )
+        .unwrap();
+        let module = SafeModule::new(distinct_module(3));
+        // First run compiles (1/1 budget used).
+        sb.execute(module.clone(), vec![], ResourceLimits::default()).unwrap();
+        // Second run is a cache hit — must succeed, never counted.
+        for _ in 0..5 {
+            sb.execute(module.clone(), vec![], ResourceLimits::default()).unwrap();
+        }
+    }
+
+    // ── CompileRateLimiter unit tests (no WASM) ────────────────────────────
+
+    #[test]
+    fn limiter_zero_budget_refuses_everything() {
+        let mut l = CompileRateLimiter::new(CompileLimits {
+            max_module_bytes: 0,
+            max_compiles_per_window: 0,
+            window_secs: 10,
+        });
+        let e = l.try_admit(Instant::now()).unwrap_err();
+        assert!(matches!(e, SandboxError::CompileRateExceeded));
+    }
+
+    #[test]
+    fn limiter_evicts_expired_admits_in_window() {
+        let mut l = CompileRateLimiter::new(CompileLimits {
+            max_module_bytes: 0,
+            max_compiles_per_window: 1,
+            window_secs: 10,
+        });
+        let t0 = Instant::now();
+        l.try_admit(t0).unwrap();
+        // 11 s later the single admit has expired — admissible again.
+        let t = t0 + Duration::from_secs(11);
+        l.try_admit(t).unwrap();
+        assert_eq!(l.len(), 1);
     }
 }
