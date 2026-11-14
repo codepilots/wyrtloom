@@ -21,6 +21,14 @@ name     = "ollama"
 base_url = "http://localhost:11434"
 model    = "llama3.2:3b"
 
+[storage]
+# Shared SQLite backing files: both the runtime (cargo run) and the dashboard
+# API (--kanban-db / --logger-db defaults) open these, so a task the runtime
+# completes is visible in the web UI and vice-versa. Override per process with
+# WYRTLOOM_KANBAN_DB / --kanban-db if needed.
+kanban_db = "kanban.db"
+logger_db = "logger.db"
+
 # [[plugin]] entries mirror the plugin manifests currently registered in
 # src/main.rs. They are informational here for the dashboard; the demo binary
 # registers its plugins in code. Add entries as the runtime moves to

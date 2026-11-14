@@ -14,24 +14,39 @@ use wyrtloom_core::types::SemVer;
 use wyrtloom_core::pipeline::{Pipeline, PipelineOutcome};
 
 /// Open the kanban board on disk when `env_var` is set to a path, else in-memory.
-fn open_kanban(env_var: &str) -> anyhow::Result<SqliteKanbanBoard> {
-    match std::env::var(env_var) {
-        Ok(path) if !path.is_empty() => {
-            println!("[boot] kanban DB: {path}");
-            Ok(SqliteKanbanBoard::open(&path)?)
+/// Config `[storage].kanban_db` takes precedence over the env var so a single
+/// `wyrtloom.toml` drives the shared board file across hosts (Path B: the
+/// dashboard API and the runtime observe the same board).
+fn open_kanban(env_var: &str, config_path: Option<&str>) -> anyhow::Result<SqliteKanbanBoard> {
+    let from_cfg = config_path
+        .map(|p| wyrtloom_config::load(p))
+        .and_then(|r| r.ok()) // config may be missing; fall back to env
+        .and_then(|c| c.storage.kanban_db);
+    let path = from_cfg.or_else(|| std::env::var(env_var).ok().filter(|p| !p.is_empty()));
+    match path {
+        Some(p) => {
+            println!("[boot] kanban DB: {p}");
+            Ok(SqliteKanbanBoard::open(&p)?)
         }
-        _ => Ok(SqliteKanbanBoard::in_memory()?),
+        None => Ok(SqliteKanbanBoard::in_memory()?),
     }
 }
 
 /// Open the call logger on disk when `env_var` is set to a path, else in-memory.
-fn open_logger(env_var: &str) -> anyhow::Result<SqliteCallLogger> {
-    match std::env::var(env_var) {
-        Ok(path) if !path.is_empty() => {
-            println!("[boot] logger DB: {path}");
-            Ok(SqliteCallLogger::open(&path)?)
+/// Config `[storage].logger_db` takes precedence over the env var, matching
+/// `open_kanban`.
+fn open_logger(env_var: &str, config_path: Option<&str>) -> anyhow::Result<SqliteCallLogger> {
+    let from_cfg = config_path
+        .map(|p| wyrtloom_config::load(p))
+        .and_then(|r| r.ok())
+        .and_then(|c| c.storage.logger_db);
+    let path = from_cfg.or_else(|| std::env::var(env_var).ok().filter(|p| !p.is_empty()));
+    match path {
+        Some(p) => {
+            println!("[boot] logger DB: {p}");
+            Ok(SqliteCallLogger::open(&p)?)
         }
-        _ => Ok(SqliteCallLogger::in_memory()?),
+        None => Ok(SqliteCallLogger::in_memory()?),
     }
 }
 
@@ -40,14 +55,16 @@ fn open_logger(env_var: &str) -> anyhow::Result<SqliteCallLogger> {
 /// exactly what the registered plugins declare: file writes under the working
 /// directory (the two SQLite plugins) and network access to localhost (the
 /// Ollama provider) — and nothing else.
-fn load_config() -> anyhow::Result<wyrtloom_config::Config> {
+/// Load the demo's `wyrtloom.toml`, returning the resolved path alongside the
+/// typed config so DB choices can read `[storage]` from the same file.
+fn load_config() -> anyhow::Result<(String, wyrtloom_config::Config)> {
     let path = std::env::var("WYRTLOOM_CONFIG")
         .unwrap_or_else(|_| "wyrtloom.toml".to_string());
     let cfg = wyrtloom_config::load(&path)
         .map_err(|e| anyhow::anyhow!("failed to load config '{path}': {e}"))?;
     wyrtloom_config::validate(&cfg)
         .map_err(|e| anyhow::anyhow!("config '{path}' invalid: {e}"))?;
-    Ok(cfg)
+    Ok((path, cfg))
 }
 
 fn main() -> anyhow::Result<()> {
@@ -55,7 +72,8 @@ fn main() -> anyhow::Result<()> {
     println!("================================\n");
 
     // Load the single source of truth: provider, security policy, plugins.
-    let cfg = load_config()?;
+    let (config_file, cfg) = load_config()?;
+    let config_path_ref: Option<&str> = Some(&config_file);
     println!("[boot] config: provider={} model={}", cfg.provider.name, cfg.provider.model);
 
     // ── Stage 1-8: Bootstrap sequence ────────────────────────────────────────
@@ -135,12 +153,12 @@ fn main() -> anyhow::Result<()> {
     // Persist to an on-disk DB when WYRTLOOM_KANBAN_DB / WYRTLOOM_LOGGER_DB are set,
     // so a separate process (e.g. the dashboard) can observe the board; otherwise
     // stay in-memory as before.
-    let kanban   = Arc::new(open_kanban("WYRTLOOM_KANBAN_DB")?);
+    let kanban   = Arc::new(open_kanban("WYRTLOOM_KANBAN_DB", config_path_ref)?);
     // Provider from config: base URL (validated at construction) comes from
     // wyrtloom.toml's [provider] table rather than the hard-coded localhost.
     let provider = Arc::new(OllamaProvider::new(cfg.provider.base_url.clone())
         .map_err(|e| anyhow::anyhow!("provider base_url invalid: {e}"))?);
-    let logger   = Arc::new(open_logger("WYRTLOOM_LOGGER_DB")?);
+    let logger   = Arc::new(open_logger("WYRTLOOM_LOGGER_DB", config_path_ref)?);
     // WasmtimeSandbox::new() is explicitly fallible; no Default impl (finding 019).
     let sandbox  = WasmtimeSandbox::new()?;
 
