@@ -40,8 +40,9 @@ persists state through storage plugins. The security boundaries we defend:
 - DB file paths are operator-supplied and trusted (see `validate_db_path`).
 - Binary-level attestation / measured boot is **not** implemented (Phase 3 —
   `security.rs` line 5, 234-235).
-- The default `SecurityPolicy` is **permissive** for the v0.1 demo; production
-  deployments must pass an explicit policy (see Gotchas).
+- `SecurityPolicy::default()` (and so `SecurityModule::new()`) is still
+  **permissive**; the bootstrap path no longer uses it, but code constructing a
+  module directly must pass an explicit policy (see Gotchas).
 
 ---
 
@@ -111,9 +112,14 @@ persists state through storage plugins. The security boundaries we defend:
   39-53, finding 020): `[a-z0-9_-]{1,64}`, rejecting path separators, escapes,
   and uppercase. Bootstrap runs this before any other manifest check
   (`bootstrap.rs` lines 52-54).
-- **Bootstrap runs security `self_check` first** (`bootstrap.rs` lines 39-40):
-  Stage 1 is the SecurityModule, and its self-check must pass before any plugin
-  manifest is verified.
+- **Bootstrap runs security `self_check` first**: Stage 1 is the SecurityModule,
+  and its self-check must pass before any plugin manifest is verified.
+- **Bootstrap is deny-all unless the host says otherwise.** `Bootstrapper::run()`
+  boots under `SecurityPolicy::deny_all()`, so a plugin requesting any file,
+  network, shell or git capability is rejected. Grants, a durable key and audit
+  persistence are supplied explicitly through `Bootstrapper::run_with(module)`.
+  The demo binary passes a policy listing only what its plugins declare
+  (writes under `.`, network to `localhost`).
 
 ### 3. WASM sandbox (`crates/plugin-sandbox-wasmtime`, `core/src/sandbox.rs`)
 
@@ -235,9 +241,14 @@ persists state through storage plugins. The security boundaries we defend:
   `/tmp`+`.` file access, localhost network, and git. This exists so the v0.1
   demo runs out of the box. **Production must construct the module with an
   explicit policy** (`with_policy(deny_all())` plus the specific grants needed,
-  ideally via `with_key` for a durable key). Note `bootstrap.rs::run` currently
-  calls `SecurityModule::new()` (line 39) — i.e. it boots with the permissive
-  default; a hardened deployment should not rely on the default bootstrap path.
+  ideally via `with_key` for a durable key). `Bootstrapper::run()` no longer
+  relies on this default — it boots deny-all — but `SecurityModule::new()` and
+  `SecurityPolicy::default()` themselves are unchanged, so any code that calls
+  them directly still gets the permissive policy.
+- **`Bootstrapper::run()` uses an ephemeral key and keeps the audit log in
+  memory.** It is safe by policy, not durable: stamps and the audit chain do not
+  survive a restart. A real deployment should call `run_with` with a module built
+  from `with_key` + `with_audit_file` (+ `with_audit_anchor`).
 - **The in-memory audit chain's keyed MAC adds nothing against an in-process
   attacker.** Any actor that can mutate the in-memory `Vec<SecurityDecision>` can
   also read `k_audit` from the same process and recompute valid links. The keying
@@ -293,9 +304,10 @@ persists state through storage plugins. The security boundaries we defend:
   data-structure accessibility.
 - **Bounded / evicting module cache** in the sandbox to cap memory under a stream
   of distinct modules.
-- **Hardened default bootstrap path**: `Bootstrapper::run` should accept an
-  explicit `SecurityPolicy` (and ideally a durable key) rather than constructing
-  `SecurityModule::new()` with the permissive default.
+- **`SecurityPolicy::default()` is still permissive.** The bootstrap path is
+  hardened (`run()` is deny-all, `run_with` takes an explicit module), but the
+  type's `Default` and `SecurityModule::new()` remain permissive for existing
+  callers and tests. Flipping them to deny-all is a separate, wider change.
 
 ---
 

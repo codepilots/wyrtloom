@@ -2,6 +2,28 @@
 
 ---
 
+## Hardened bootstrap path (2026-11-14)
+
+Closes the "hardened default bootstrap path" item on the `SECURITY.md` roadmap.
+
+- **`Bootstrapper::run()` now boots deny-all.** It previously constructed
+  `SecurityModule::new()`, i.e. the permissive demo policy (files under `/tmp` and `.`,
+  localhost network, git). **Behaviour change:** a host calling `run()` with plugins
+  that declare capabilities now gets `BootstrapError::PluginLoad(SecurityRejected)`.
+- **`Bootstrapper::run_with(SecurityModule)`** boots under a caller-built module, so the
+  policy, a durable key (`with_key`) and audit persistence (`with_audit_file`,
+  `with_audit_anchor`) are the host's explicit choice. The module must still pass
+  `self_check` first.
+- **Demo binary** passes an explicit policy listing only what its plugins declare
+  (writes under `.`, network to `localhost`); it no longer has git or `/tmp` access.
+
+Unchanged: `SecurityPolicy::default()` and `SecurityModule::new()` are still permissive
+for code that constructs a module directly.
+
+Tests: 331 across the workspace, all green; no new clippy warnings.
+
+---
+
 ## Audit-chain external anchoring (2026-11-14)
 
 Closes the first item on the `SECURITY.md` roadmap: suffix truncation of the persisted

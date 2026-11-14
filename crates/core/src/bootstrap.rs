@@ -4,7 +4,7 @@
 /// Security initialises first and verifies each subsequent stage.
 use crate::bus::{BootstrapBus, Event, MessageBus};
 use crate::plugin::{CoreContractVersions, LoadError, PluginClass, PluginManifest, PluginRegistry};
-use crate::security::SecurityModule;
+use crate::security::{SecurityModule, SecurityPolicy};
 use std::sync::Arc;
 
 pub struct BootstrappedSystem {
@@ -32,11 +32,27 @@ impl Bootstrapper {
         self.registry.register(manifest, factory);
     }
 
-    /// Run the bootstrap sequence.  Returns the live system or an error
-    /// describing the stage that failed.
+    /// Run the bootstrap sequence with the hardened default: a **deny-all**
+    /// policy and an ephemeral key. Plugins that declare no capabilities load;
+    /// any plugin requesting file, network, shell or git access is rejected.
+    ///
+    /// A host that needs to grant capabilities, keep a durable key, or persist
+    /// the audit log must say so explicitly via [`run_with`](Self::run_with).
     pub fn run(self) -> Result<BootstrappedSystem, BootstrapError> {
+        self.run_with(SecurityModule::with_policy(SecurityPolicy::deny_all()))
+    }
+
+    /// Run the bootstrap sequence under a caller-built [`SecurityModule`], so
+    /// the policy, key and audit persistence are the host's explicit choice:
+    /// build it with `with_key` for stamps and an audit chain that survive a
+    /// restart, and `with_audit_file` / `with_audit_anchor` for a persisted,
+    /// truncation-evident log. The module still has to pass its own
+    /// `self_check` before anything else runs.
+    ///
+    /// Returns the live system or an error describing the stage that failed.
+    pub fn run_with(self, security: SecurityModule) -> Result<BootstrappedSystem, BootstrapError> {
         // Stage 1 — Security & Trust Module
-        let security = Arc::new(SecurityModule::new());
+        let security = Arc::new(security);
         security.self_check().map_err(|e| BootstrapError::SecurityInit(e.to_string()))?;
 
         // Stage 2 — Plugin Loader (manifests are already in registry; verify here)
@@ -136,6 +152,103 @@ mod tests {
         let mut b = Bootstrapper::new();
         b.register_plugin(safe_manifest("kanban-sqlite"), || Arc::new(()));
         b.run().expect("bootstrap with safe plugin must succeed");
+    }
+
+    fn unsafe_manifest(name: &str, capabilities: Vec<Capability>) -> PluginManifest {
+        PluginManifest {
+            name: name.into(),
+            version: SemVer::new(0, 1, 0),
+            class: PluginClass::Unsafe,
+            capabilities,
+            implements: vec![("wyrtloom.kanban".into(), SemVer::new(0, 1, 0))],
+        }
+    }
+
+    // The default path must grant nothing: every capability the old permissive
+    // default allowed (cwd / /tmp files, localhost network, git) is refused.
+    #[test]
+    fn default_run_denies_every_capability() {
+        for cap in [
+            Capability::FileRead(".".into()),
+            Capability::FileWrite("/tmp".into()),
+            Capability::Network("localhost".into()),
+            Capability::Git,
+            Capability::Shell,
+        ] {
+            let mut b = Bootstrapper::new();
+            b.register_plugin(unsafe_manifest("needs-access", vec![cap.clone()]), || Arc::new(()));
+            match b.run() {
+                Err(BootstrapError::PluginLoad(LoadError::SecurityRejected(_))) => {}
+                Err(other) => panic!("{cap:?}: expected SecurityRejected, got {other}"),
+                Ok(_) => panic!("{cap:?} must be denied by the default bootstrap path"),
+            }
+        }
+    }
+
+    #[test]
+    fn default_run_still_loads_an_unsafe_plugin_with_no_capabilities() {
+        let mut b = Bootstrapper::new();
+        b.register_plugin(unsafe_manifest("no-access", vec![]), || Arc::new(()));
+        b.run().expect("a plugin asking for nothing loads under deny-all");
+    }
+
+    #[test]
+    fn run_with_grants_only_what_the_supplied_policy_allows() {
+        let policy = || SecurityPolicy {
+            file_write_prefixes: vec!["/var/lib/wyrtloom".into()],
+            ..SecurityPolicy::deny_all()
+        };
+
+        let mut b = Bootstrapper::new();
+        b.register_plugin(
+            unsafe_manifest("store", vec![Capability::FileWrite("/var/lib/wyrtloom/db".into())]),
+            || Arc::new(()),
+        );
+        b.run_with(SecurityModule::with_policy(policy()))
+            .expect("capability inside the explicit policy must load");
+
+        let mut b = Bootstrapper::new();
+        b.register_plugin(
+            unsafe_manifest("net", vec![Capability::Network("localhost".into())]),
+            || Arc::new(()),
+        );
+        assert!(
+            b.run_with(SecurityModule::with_policy(policy())).is_err(),
+            "capability outside the explicit policy must be rejected"
+        );
+    }
+
+    // The system must run on the module the host supplied (its key), not a
+    // freshly constructed one.
+    #[test]
+    fn run_with_uses_the_supplied_module() {
+        let key = [42u8; 32];
+        let sys = Bootstrapper::new()
+            .run_with(SecurityModule::with_key(key, SecurityPolicy::deny_all()))
+            .unwrap();
+        let same_key = SecurityModule::with_key(key, SecurityPolicy::deny_all());
+        let stamp = sys.security.stamp(b"payload");
+        assert!(same_key.is_valid(&stamp, b"payload"));
+    }
+
+    #[test]
+    fn run_with_rejects_a_module_that_fails_self_check() {
+        let zero_key = SecurityModule::with_key([0u8; 32], SecurityPolicy::deny_all());
+        match Bootstrapper::new().run_with(zero_key) {
+            Err(BootstrapError::SecurityInit(_)) => {}
+            Err(other) => panic!("expected SecurityInit, got {other}"),
+            Ok(_) => panic!("an all-zero key must halt bootstrap at stage 1"),
+        }
+    }
+
+    #[test]
+    fn rejected_capability_is_audited_in_the_supplied_module() {
+        // A denial must land in the audit chain. We cannot read the module back
+        // out of a failed run, so check the same decision on the module directly.
+        let security = SecurityModule::with_policy(SecurityPolicy::deny_all());
+        let manifest = unsafe_manifest("net", vec![Capability::Network("localhost".into())]);
+        assert!(security.verify(&manifest).is_err());
+        assert_eq!(security.audit_log_snapshot().len(), 1);
     }
 
     #[test]

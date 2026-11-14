@@ -391,12 +391,21 @@ bootstrapper.register_plugin(
     || std::sync::Arc::new(()), // factory: Fn() -> Arc<dyn Any + Send + Sync>
 );
 
-let sys = bootstrapper.run()?; // validates names, versions, Safe/capability, security
+// The default `run()` is deny-all and would reject the FileWrite capability
+// above, so the host grants it explicitly.
+let policy = SecurityPolicy {
+    file_write_prefixes: vec![".".into()],
+    ..SecurityPolicy::deny_all()
+};
+let sys = bootstrapper.run_with(SecurityModule::with_policy(policy))?;
+// validates names, versions, Safe/capability, security
 ```
 
 `register_plugin(manifest, factory)` records the manifest and a type-erased
-factory (`Fn() -> Arc<dyn Any + Send + Sync>`). `Bootstrapper::run()` runs the
-fixed bootstrap sequence: Security module first, then for every manifest it
+factory (`Fn() -> Arc<dyn Any + Send + Sync>`). `Bootstrapper::run()` boots under a
+**deny-all** policy, so a plugin that declares any capability only loads when the
+host passes a `SecurityModule` whose policy grants it, via `run_with`. Either way
+the fixed bootstrap sequence runs: Security module first, then for every manifest it
 validates the name charset, checks contract-version compatibility, rejects a Safe
 plugin that declares capabilities, and security-verifies the manifest. Any
 failure halts boot with a logged `BootstrapError`. The concrete implementations

@@ -277,10 +277,11 @@ Treat them as deployment requirements.
   fixed plugin set, risky for arbitrary tenant-supplied modules. Bounded/evicting
   cache is roadmapped.
 - **`permissive()` is the v0.1 demo default.** `SecurityPolicy::default()` is
-  permissive (grants `/tmp`+`.`, localhost network, git) so the demo runs out of
-  the box, and the default `bootstrap.rs::run` path boots with it. **Production must
-  construct the module with an explicit policy** (`deny_all()` plus specific grants)
-  and a durable key. The dashboard API already falls back to `deny_all()` on a
+  permissive (grants `/tmp`+`.`, localhost network, git), and `SecurityModule::new()`
+  uses it. The bootstrap path does not: `Bootstrapper::run()` boots deny-all, and
+  grants are passed explicitly through `Bootstrapper::run_with(module)`. **Production
+  must construct the module with an explicit policy** (`deny_all()` plus specific
+  grants) and a durable key. The dashboard API already falls back to `deny_all()` on a
   failed config load.
 - **Remote use needs TLS.** The API binds loopback plain HTTP and refuses a
   non-loopback bind unless `--insecure-allow-remote-http` is passed. Terminate TLS
