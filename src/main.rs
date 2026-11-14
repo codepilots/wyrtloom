@@ -11,6 +11,7 @@ use wyrtloom_core::bootstrap::Bootstrapper;
 use wyrtloom_core::plugin::{Capability, PluginClass, PluginManifest};
 use wyrtloom_core::profile::TaskProfile;
 use wyrtloom_core::sandbox::{ResourceLimits, SafeModule, SandboxRuntime};
+use wyrtloom_core::security::{SecurityModule, SecurityPolicy};
 use wyrtloom_core::types::SemVer;
 
 use pipeline::{Pipeline, PipelineOutcome};
@@ -34,6 +35,18 @@ fn open_logger(env_var: &str) -> anyhow::Result<SqliteCallLogger> {
             Ok(SqliteCallLogger::open(&path)?)
         }
         _ => Ok(SqliteCallLogger::in_memory()?),
+    }
+}
+
+/// The demo's security policy: exactly what its registered plugins declare —
+/// file writes under the working directory (the two SQLite plugins) and network
+/// access to localhost (the Ollama provider) — and nothing else. The default
+/// bootstrap path is deny-all, so these grants have to be spelled out.
+fn demo_policy() -> SecurityPolicy {
+    SecurityPolicy {
+        file_write_prefixes: vec![".".into()],
+        network_allowlist: vec!["localhost".into()],
+        ..SecurityPolicy::deny_all()
     }
 }
 
@@ -106,7 +119,9 @@ fn main() -> anyhow::Result<()> {
         || Arc::new(()),
     );
 
-    let sys = bootstrapper.run().map_err(|e| anyhow::anyhow!("{}", e))?;
+    let sys = bootstrapper
+        .run_with(SecurityModule::with_policy(demo_policy()))
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
     println!("[boot] Security + all plugins verified ✓");
 
     let audit = sys.security.audit_log_snapshot();

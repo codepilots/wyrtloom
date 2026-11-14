@@ -164,7 +164,8 @@ system never proceeds in a partially-secured state.
 
 What `Bootstrapper::run` actually does, in order:
 
-1. `SecurityModule::new()` then `self_check()` — refuses to proceed if its own integrity
+1. Take the `SecurityModule` — the one the host passed to `run_with`, or for plain
+   `run()` a fresh module under `SecurityPolicy::deny_all()` — then `self_check()` — refuses to proceed if its own integrity
    check fails (e.g. an all-zero RNG-failed key). This is the *SAFE-before-unsafe* anchor:
    nothing else runs until the root of trust verifies itself.
 2. Build `CoreContractVersions::v0_1()` — the floor versions the loader checks against.
