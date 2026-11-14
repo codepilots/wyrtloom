@@ -145,7 +145,11 @@ persists state through storage plugins. The security boundaries we defend:
 - **SHA-256-keyed module cache** (lines 124-135, finding 014): compiled modules
   are cached by the `content_hash` precomputed in `SafeModule::new`
   (`sandbox.rs` lines 25-32), avoiding repeated Cranelift compilation (a CPU-DoS
-  vector).
+  vector). The cache is **bounded** (finding 030): `ModuleCacheLimits` caps both
+  the number of cached modules and their total source WASM bytes (default 64
+  modules / 64 MiB), evicting the least recently used. A module larger than the
+  whole byte budget is run but not cached. Tune with
+  `WasmtimeSandbox::with_cache_limits`.
 
 ### 4. Storage plugins (`plugin-kanban-sqlite`, `plugin-logger-sqlite`)
 
@@ -278,10 +282,13 @@ persists state through storage plugins. The security boundaries we defend:
   (`storage.rs` lines 1-16). It permits **absolute paths and symlinks** — it only
   blocks `ParentDir` components. DB paths must be **operator-trusted**; do not
   feed it untrusted input expecting it to jail writes to a directory.
-- **Module cache is unbounded** (`plugin-sandbox-wasmtime/lib.rs` lines 60,
-  124-135). Many *distinct* WASM modules grow the cache without eviction; a stream
-  of unique modules is a memory-growth vector. Fine for a fixed plugin set, risky
-  for arbitrary tenant-supplied modules.
+- **The module-cache byte limit counts source WASM, not compiled code.**
+  `max_wasm_bytes` is a proxy: compiled machine code is typically several times
+  larger than its source, so real retained memory exceeds the configured figure.
+  The cache bounds what is *retained*; it does not limit the size of a single
+  module submitted for compilation, and a stream of distinct modules still costs
+  one Cranelift compile each. Callers accepting tenant-supplied modules should
+  cap module size and rate before calling `execute`.
 - **`record_decision` / audit detail must never carry secrets.** `sanitize_detail`
   de-fangs control/bidi characters but does not redact — never pass key/token
   material as audit detail (`security.rs` lines 311-313).
@@ -302,8 +309,9 @@ persists state through storage plugins. The security boundaries we defend:
 - **Binary measurement / platform attestation** in `self_check` — reserved for
   Phase 3 (`security.rs` lines 4-5, 234-235). v0.1 validates only key entropy and
   data-structure accessibility.
-- **Bounded / evicting module cache** in the sandbox to cap memory under a stream
-  of distinct modules.
+- **Per-module size and compile-rate limits** in the sandbox. The module cache is
+  now bounded, but a single very large module, or a rapid stream of distinct
+  ones, is still compiled on demand.
 - **`SecurityPolicy::default()` is still permissive.** The bootstrap path is
   hardened (`run()` is deny-all, `run_with` takes an explicit module), but the
   type's `Default` and `SecurityModule::new()` remain permissive for existing
