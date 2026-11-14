@@ -2,6 +2,38 @@
 
 ---
 
+## Audit-chain external anchoring (2026-11-14)
+
+Closes the first item on the `SECURITY.md` roadmap: suffix truncation of the persisted
+audit log is now detectable. Additive and opt-in; existing callers are unaffected.
+
+- **`SecurityModule::with_audit_anchor(store, enrollment)`** keeps a signed high-water mark
+  (entry count + chain head, HMAC'd under a new domain-separated `wyrtloom-audit-anchor-v1`
+  sub-key) in a store outside the log, and advances it after every audit entry. On open it
+  fails closed if the log is shorter than the anchor, the anchor's MAC is invalid, the log
+  does not pass through the anchored head, or the store errors. A log *ahead* of its anchor
+  (crash between the log write and the anchor update) is accepted and re-anchored.
+- **`AnchorEnrollment`**: `Strict` rejects a missing anchor for a non-empty log;
+  `EnrollExisting` is the explicit one-time adoption path for an existing log.
+- **`verify_anchor()`** / **`audit_anchor_configured()`** for health checks: reports a
+  missing, forged, or out-of-step (stale) anchor.
+- **New `audit_anchor` module**: `AuditAnchorRecord`, the `AuditAnchorStore` trait, and
+  `PersistenceAuditAnchor`, an adapter over `dyn PersistenceProvider` so the anchor can live
+  in any persistence plugin (no new dependency in core).
+- **Fix — audit entries could reach the file out of chain order.** `audit()` released the
+  chain-head lock before writing, so two concurrent calls could append their lines in the
+  opposite order to their links, producing a file that failed verification on the next
+  open. The lock is now held across the file write, the in-memory push and the anchor
+  update.
+
+Known limits (documented in `SECURITY.md`): the anchor is only as strong as its store's
+separation from the log (an attacker who can write both can replay an older anchor); the
+dashboard API does not wire an anchor in yet.
+
+Tests: 325 across the workspace, all green; no new clippy warnings (15 pre-existing, none in the changed code).
+
+---
+
 ## Core extensions for the dashboard ecosystem (2026-06-14)
 
 Additive, backward-compatible core changes that enable a separate-repo dashboard ecosystem

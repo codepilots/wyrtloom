@@ -653,6 +653,8 @@ impl SecurityModule {
     pub fn with_policy(policy: SecurityPolicy) -> Self;
     pub fn with_key(key: [u8; 32], policy: SecurityPolicy) -> Self;  // durable, persisted key
     pub fn with_audit_file(self, path: &str) -> Result<Self, SecurityError>;
+    pub fn with_audit_anchor(self, store: Arc<dyn AuditAnchorStore>,   // after with_audit_file
+        enrollment: AnchorEnrollment) -> Result<Self, SecurityError>;
 
     pub fn self_check(&self) -> Result<(), SecurityError>;     // runs first; rejects all-zero key
     pub fn verify(&self, manifest: &PluginManifest) -> Result<(), SecurityError>;
@@ -662,6 +664,21 @@ impl SecurityModule {
     pub fn record_decision(&self, granted: bool, detail: String);   // sanitised, into chain
     pub fn audit_log_snapshot(&self) -> Vec<SecurityDecision>;
     pub fn verify_chain(&self) -> Result<(), SecurityError>;   // keyed hash-chain integrity
+    pub fn audit_anchor_configured(&self) -> bool;
+    pub fn verify_anchor(&self) -> Result<(), SecurityError>;  // anchor present, signed, in step
+}
+
+pub enum AnchorEnrollment { Strict, EnrollExisting }           // missing-anchor handling
+
+// audit_anchor.rs — where the signed high-water mark is kept (outside the log)
+pub struct AuditAnchorRecord { pub count: u64, pub head: String, pub mac: String }
+pub trait AuditAnchorStore: Send + Sync {
+    fn load(&self) -> Result<Option<AuditAnchorRecord>, AnchorStoreError>;
+    fn store(&self, record: &AuditAnchorRecord) -> Result<(), AnchorStoreError>;
+}
+pub struct PersistenceAuditAnchor { /* adapter over dyn PersistenceProvider */ }
+impl PersistenceAuditAnchor {
+    pub fn new(store: Arc<dyn PersistenceProvider>, id: &str) -> Result<Self, AnchorStoreError>;
 }
 
 pub struct SecurityPolicy {
@@ -688,6 +705,13 @@ Key invariants this enforces:
 - Audit entries form a **keyed hash-chain**; persisted audit files are opened 0600 via the
   open fd (no TOCTOU), bounded against OOM, and **verified on open** (a tampered file is
   rejected). Raw MACs and free-text detail are redacted / sanitised before logging.
+- With `with_audit_anchor`, a signed **high-water mark** (entry count + chain head, under
+  its own sub-key) is kept in an `AuditAnchorStore` and advanced after every entry. Opening
+  a log **shorter than its anchor fails closed** (suffix truncation), as does a forged
+  anchor, an anchor for a different chain, a store error, or — under `Strict` — a missing
+  anchor for a non-empty log. `EnrollExisting` is for one-time adoption on an existing log.
+  An `AuditAnchorStore` MUST report a damaged record as an error, never as absent, and
+  SHOULD refuse a `store` that lowers `count` if it can.
 
 ### 10.2 Plugin model (`plugin.rs`)
 

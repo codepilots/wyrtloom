@@ -261,12 +261,15 @@ Treat them as deployment requirements.
   components but permits **absolute paths and symlinks** (shared by the config
   loader and the SQLite store). DB and config paths must be operator-trusted; do
   not feed it untrusted input expecting a jail.
-- **Audit suffix-truncation needs external anchoring (roadmap).** The keyed chain
-  detects in-place tampering, reordering, and mid-chain deletion, but an attacker
-  who can rewrite the entire file from the start can produce a self-consistent
-  shorter chain. Detecting truncation needs an external high-water mark (a signed
-  entry-count / chain-head stored outside the log) — roadmapped, not yet
-  implemented. Note also that the keyed MAC buys nothing against an in-process
+- **Audit suffix-truncation is caught only with an external anchor, which is
+  opt-in.** The keyed chain detects in-place tampering, reordering, and mid-chain
+  deletion, but dropping the newest entries leaves a self-consistent shorter
+  chain. Core now provides `SecurityModule::with_audit_anchor`: a signed
+  high-water mark (entry count + chain head) kept in an `AuditAnchorStore`
+  outside the log, checked on open (a log shorter than its anchor is rejected)
+  and by `verify_anchor`. It is only as strong as the store's separation from the
+  log — an attacker who can write both can replay an older anchor — and the
+  dashboard API does not wire one in yet. Note also that the keyed MAC buys nothing against an in-process
   attacker (who can read `k_audit` from the same process); it matters only for a
   persisted log verified later by a separate trusted process.
 - **Unbounded WASM module cache.** Compiled modules are cached by content hash with

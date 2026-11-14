@@ -68,14 +68,23 @@ persists state through storage plugins. The security boundaries we defend:
   `prev_hash` is the HMAC (under `k_audit`, with a domain tag
   `wyrtloom-audit-chain-v1\0`) of the previous entry's serialization.
   `verify_chain` (lines 341-354) walks the chain and reports the first broken
-  link; `audit()` holds the `last_hash` lock across read-compute-write so
-  concurrent appends cannot fork the chain (lines 402-414).
+  link; `audit()` holds the chain-head lock across the whole append (link,
+  file write, in-memory push, anchor update) so concurrent appends can neither
+  fork the chain nor reach the file out of chain order.
 - **Persistent audit file opened 0600 with restart re-anchoring**
   (`with_audit_file`, lines 186-227, finding 028). The file is created
   `mode(0o600)` and permissions are *defensively re-applied* to a pre-existing
   file (lines 189-200). On reopen, existing entries are loaded and the chain head
   is re-anchored from the **last** line so new entries link onto old ones across
   the restart (lines 205-223; verified by `audit_file_chains_across_restart`).
+- **External high-water-mark anchor** (`with_audit_anchor`, `verify_anchor`,
+  `audit_anchor.rs`, finding 029). Opt-in. A signed `(entry count, chain head)`
+  record, MAC'd under the dedicated `wyrtloom-audit-anchor-v1` sub-key, is kept
+  in an `AuditAnchorStore` outside the log and advanced after each entry. Opening
+  a log shorter than its anchor fails closed, which is what detects **suffix
+  truncation**; a forged anchor, an anchor for another chain, a store error, and
+  (under `AnchorEnrollment::Strict`) a missing anchor for a non-empty log are
+  rejected too. See the limits under "Gotchas / watch-outs".
 - **`record_decision`** (lines 314-317) lets consumers (e.g. an API server) write
   grant/deny decisions into the same tamper-evident chain.
 - **`sanitize_detail`** (lines 459-465) caps detail at 512 chars and strips both
@@ -234,10 +243,26 @@ persists state through storage plugins. The security boundaries we defend:
   also read `k_audit` from the same process and recompute valid links. The keying
   only matters for a **persisted** log verified later by a separate trusted
   process (`security.rs` lines 327-338).
-- **Suffix truncation of the audit chain is undetected.** Dropping the most
-  recent entries leaves a still-valid shorter chain; `verify_chain` only catches
-  in-place mutation, reordering, and mid-chain deletion (lines 335-338). Detecting
-  truncation needs an external high-water mark (roadmap below).
+- **Suffix truncation of the audit chain is detected only when an external
+  anchor is configured.** Dropping the most recent entries leaves a still-valid
+  shorter chain, and `verify_chain` alone only catches in-place mutation,
+  reordering, and mid-chain deletion. `with_audit_anchor` adds a signed
+  high-water mark (entry count + chain head, MAC'd under a dedicated anchor
+  sub-key) kept in an `AuditAnchorStore` outside the log; opening a log shorter
+  than its anchor fails closed. It is **opt-in**, and its limits are:
+  - The anchor is only as strong as its store's separation from the log. An
+    attacker who can write both can **replay an older genuine anchor** next to
+    a matching truncated log; deleting both looks like a fresh install. Keep the
+    anchor somewhere the log's attacker cannot reach.
+  - The log entry is written before the anchor advances, so entries after the
+    last successful anchor update (normally at most one, in a crash window) are
+    not yet protected. A failing store leaves the anchor stale; auditing
+    continues and `verify_anchor` reports it.
+  - A missing anchor for a non-empty log is rejected under
+    `AnchorEnrollment::Strict`. `EnrollExisting` accepts it and is for one-time
+    adoption only — left on, it lets an attacker who deletes the anchor reset it.
+  - It needs a durable key (`with_key`); the anchor MAC cannot be checked under
+    a fresh random key.
 - **`validate_db_path` is a `..` traversal screen, NOT a confinement boundary**
   (`storage.rs` lines 1-16). It permits **absolute paths and symlinks** — it only
   blocks `ParentDir` components. DB paths must be **operator-trusted**; do not
@@ -258,9 +283,11 @@ persists state through storage plugins. The security boundaries we defend:
 
 ## Known limitations (roadmap)
 
-- **External high-water-mark anchoring** for the audit chain, to detect suffix
-  truncation (a signed entry-count / chain-head stored outside the log)
-  — `security.rs` lines 336-338.
+- **A remote / append-only anchor store.** External high-water-mark anchoring is
+  implemented (`with_audit_anchor`), with one store adapter over the persistence
+  contract (`PersistenceAuditAnchor`). A store that enforces monotonicity off-host
+  — closing the anchor-replay limit above — is not yet built, and the dashboard
+  API does not yet wire an anchor in.
 - **Binary measurement / platform attestation** in `self_check` — reserved for
   Phase 3 (`security.rs` lines 4-5, 234-235). v0.1 validates only key entropy and
   data-structure accessibility.

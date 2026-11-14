@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod audit_anchor;
 pub mod bootstrap;
 pub mod bus;
 pub mod canon;
