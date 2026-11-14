@@ -8,6 +8,7 @@ pub mod escalation;
 pub mod kanban;
 pub mod logger;
 pub mod persistence;
+pub mod pipeline;
 pub mod plugin;
 pub mod profile;
 pub mod provider;

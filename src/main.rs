@@ -1,5 +1,3 @@
-mod pipeline;
-
 use std::sync::Arc;
 
 use plugin_escalation_cli::{CliEscalation, ScriptedEscalation};
@@ -13,8 +11,7 @@ use wyrtloom_core::profile::TaskProfile;
 use wyrtloom_core::sandbox::{ResourceLimits, SafeModule, SandboxRuntime};
 use wyrtloom_core::security::SecurityModule;
 use wyrtloom_core::types::SemVer;
-
-use pipeline::{Pipeline, PipelineOutcome};
+use wyrtloom_core::pipeline::{Pipeline, PipelineOutcome};
 
 /// Open the kanban board on disk when `env_var` is set to a path, else in-memory.
 fn open_kanban(env_var: &str) -> anyhow::Result<SqliteKanbanBoard> {
