@@ -1,0 +1,27 @@
+# Wyrtloom configuration — single source of truth for the runtime.
+# The demo binary (cargo run) reads this from ./wyrtloom.toml unless
+# WYRTLOOM_CONFIG points elsewhere. dashboard-api also consumes the same schema.
+
+[security]
+# Exactly what the demo's registered plugins declare and nothing more.
+# The two SQLite plugins write under the working directory; the Ollama
+# provider talks to localhost. Default bootstrap is deny-all, so these
+# grants are spelled out explicitly.
+file_read_prefixes  = []
+file_write_prefixes = ["."]
+network_allowlist   = ["localhost"]
+allow_shell = false
+allow_git   = false
+
+[provider]
+# Local mode: a local Ollama. base_url must be http://localhost… /
+# http://127.0.0.1… / https://… (SSRF guard). model must be a tag installed
+# in that Ollama — use `ollama list` to see what's available.
+name     = "ollama"
+base_url = "http://localhost:11434"
+model    = "llama3.2:3b"
+
+# [[plugin]] entries mirror the plugin manifests currently registered in
+# src/main.rs. They are informational here for the dashboard; the demo binary
+# registers its plugins in code. Add entries as the runtime moves to
+# config-driven plugin loading.

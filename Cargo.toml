@@ -55,6 +55,7 @@ license.workspace = true
 
 [dependencies]
 wyrtloom-core               = { workspace = true }
+wyrtloom-config             = { path = "../wyrtloom-config" }
 plugin-kanban-sqlite        = { path = "crates/plugin-kanban-sqlite" }
 plugin-provider-ollama      = { path = "crates/plugin-provider-ollama" }
 plugin-sandbox-wasmtime     = { path = "crates/plugin-sandbox-wasmtime" }

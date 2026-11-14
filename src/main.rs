@@ -11,7 +11,7 @@ use wyrtloom_core::bootstrap::Bootstrapper;
 use wyrtloom_core::plugin::{Capability, PluginClass, PluginManifest};
 use wyrtloom_core::profile::TaskProfile;
 use wyrtloom_core::sandbox::{ResourceLimits, SafeModule, SandboxRuntime};
-use wyrtloom_core::security::{SecurityModule, SecurityPolicy};
+use wyrtloom_core::security::SecurityModule;
 use wyrtloom_core::types::SemVer;
 
 use pipeline::{Pipeline, PipelineOutcome};
@@ -38,21 +38,28 @@ fn open_logger(env_var: &str) -> anyhow::Result<SqliteCallLogger> {
     }
 }
 
-/// The demo's security policy: exactly what its registered plugins declare —
-/// file writes under the working directory (the two SQLite plugins) and network
-/// access to localhost (the Ollama provider) — and nothing else. The default
-/// bootstrap path is deny-all, so these grants have to be spelled out.
-fn demo_policy() -> SecurityPolicy {
-    SecurityPolicy {
-        file_write_prefixes: vec![".".into()],
-        network_allowlist: vec!["localhost".into()],
-        ..SecurityPolicy::deny_all()
-    }
+/// The demo's security policy, read from `wyrtloom.toml` (the `[security]`
+/// table). The default bootstrap path is deny-all, so the file must spell out
+/// exactly what the registered plugins declare: file writes under the working
+/// directory (the two SQLite plugins) and network access to localhost (the
+/// Ollama provider) — and nothing else.
+fn load_config() -> anyhow::Result<wyrtloom_config::Config> {
+    let path = std::env::var("WYRTLOOM_CONFIG")
+        .unwrap_or_else(|_| "wyrtloom.toml".to_string());
+    let cfg = wyrtloom_config::load(&path)
+        .map_err(|e| anyhow::anyhow!("failed to load config '{path}': {e}"))?;
+    wyrtloom_config::validate(&cfg)
+        .map_err(|e| anyhow::anyhow!("config '{path}' invalid: {e}"))?;
+    Ok(cfg)
 }
 
 fn main() -> anyhow::Result<()> {
     println!("🌿 Wyrtloom v0.1 — The Seed");
     println!("================================\n");
+
+    // Load the single source of truth: provider, security policy, plugins.
+    let cfg = load_config()?;
+    println!("[boot] config: provider={} model={}", cfg.provider.name, cfg.provider.model);
 
     // ── Stage 1-8: Bootstrap sequence ────────────────────────────────────────
     let mut bootstrapper = Bootstrapper::new();
@@ -120,7 +127,7 @@ fn main() -> anyhow::Result<()> {
     );
 
     let sys = bootstrapper
-        .run_with(SecurityModule::with_policy(demo_policy()))
+        .run_with(SecurityModule::with_policy(cfg.security_policy()))
         .map_err(|e| anyhow::anyhow!("{}", e))?;
     println!("[boot] Security + all plugins verified ✓");
 
@@ -132,8 +139,10 @@ fn main() -> anyhow::Result<()> {
     // so a separate process (e.g. the dashboard) can observe the board; otherwise
     // stay in-memory as before.
     let kanban   = Arc::new(open_kanban("WYRTLOOM_KANBAN_DB")?);
-    // OllamaProvider::new() is now fallible — URL validated at construction.
-    let provider = Arc::new(OllamaProvider::default_local());
+    // Provider from config: base URL (validated at construction) comes from
+    // wyrtloom.toml's [provider] table rather than the hard-coded localhost.
+    let provider = Arc::new(OllamaProvider::new(cfg.provider.base_url.clone())
+        .map_err(|e| anyhow::anyhow!("provider base_url invalid: {e}"))?);
     let logger   = Arc::new(open_logger("WYRTLOOM_LOGGER_DB")?);
     // WasmtimeSandbox::new() is explicitly fallible; no Default impl (finding 019).
     let sandbox  = WasmtimeSandbox::new()?;
@@ -178,12 +187,17 @@ fn main() -> anyhow::Result<()> {
             Arc::new(ScriptedEscalation::stop())
         };
 
+    let mut profile = TaskProfile::default_v01();
+    // The model is a single source of truth in wyrtloom.toml [provider], not
+    // baked into the profile's default.
+    profile.model = cfg.provider.model.clone();
+
     let pipeline = Pipeline {
         kanban:    kanban.clone(),
         provider:  provider.clone(),
         logger:    logger.clone(),
         escalation,
-        profile:   TaskProfile::default_v01(),
+        profile,
         agent_id:  "agent:wyrtloom-v01".into(),
     };
 
